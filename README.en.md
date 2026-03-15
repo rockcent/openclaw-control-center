@@ -1,3 +1,5 @@
+> 中文用户可在这里切换：[打开中文 README](README.md)
+
 # OpenClaw Control Center
 
 <img src="docs/assets/overview-hero-en.png" alt="OpenClaw Control Center overview hero screenshot" width="1200" />

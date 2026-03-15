@@ -1,3 +1,5 @@
+> Looking for English? Start here: [Open the English README](README.en.md)
+
 # OpenClaw Control Center
 
 <img src="docs/assets/overview-hero-zh.png" alt="OpenClaw Control Center 总览横幅截图" width="1200" />
