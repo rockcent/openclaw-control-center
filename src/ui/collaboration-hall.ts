@@ -891,9 +891,7 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
     });
     return removed;
   };
-  const syntheticVisibleDrafts = () => {
-    if (!selectedTaskCardId) return [];
-    const taskCard = currentTaskCard();
+  const syntheticDiscussionDrafts = (taskCard) => {
     if (!taskCard || taskCard.stage !== 'discussion') return [];
     const expectedParticipantIds = Array.isArray(taskCard.discussionCycle?.expectedParticipantIds)
       ? taskCard.discussionCycle.expectedParticipantIds
@@ -919,13 +917,62 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
       content: '',
     }));
   };
+  const syntheticExecutionHandoffDraft = (taskCard, persistedThreadMessages) => {
+    if (!taskCard || taskCard.stage !== 'execution' || !taskCard.currentOwnerParticipantId) return [];
+    const ownerParticipantId = String(taskCard.currentOwnerParticipantId || '').trim();
+    if (!ownerParticipantId) return [];
+    const updatedAt = Date.parse(taskCard.updatedAt || taskCard.createdAt || '') || 0;
+    const now = Date.now();
+    if (!updatedAt || now - updatedAt > 45_000) return [];
+    const latestHandoff = [...persistedThreadMessages].reverse().find((message) => {
+      if (!message || message.authorParticipantId === ownerParticipantId || message.authorParticipantId === 'operator') return false;
+      if (String(message.taskCardId || '') !== String(taskCard.taskCardId || '')) return false;
+      const targetIds = Array.isArray(message.targetParticipantIds) ? message.targetParticipantIds : [];
+      if (!targetIds.includes(ownerParticipantId)) return false;
+      const createdAt = Date.parse(message.createdAt || '') || 0;
+      return createdAt >= updatedAt - 1_000;
+    });
+    if (!latestHandoff) return [];
+    const handoffAt = Date.parse(latestHandoff.createdAt || '') || updatedAt;
+    const ownerAlreadyReplied = persistedThreadMessages.some((message) => {
+      if (!message || String(message.authorParticipantId || '') !== ownerParticipantId) return false;
+      const createdAt = Date.parse(message.createdAt || '') || 0;
+      return createdAt >= handoffAt;
+    });
+    if (ownerAlreadyReplied) return [];
+    return [{
+      draftId: 'synthetic-execution:' + taskCard.taskCardId + ':' + ownerParticipantId,
+      createdAt: latestHandoff.createdAt || taskCard.updatedAt || new Date().toISOString(),
+      lastDeltaAt: latestHandoff.createdAt || taskCard.updatedAt || new Date().toISOString(),
+      authorLabel: participantLabel(ownerParticipantId),
+      authorParticipantId: ownerParticipantId,
+      authorSemanticRole: participantIndex.get(ownerParticipantId)?.semanticRole,
+      messageKind: 'handoff',
+      taskCardId: taskCard.taskCardId,
+      projectId: taskCard.projectId,
+      taskId: taskCard.taskId,
+      roomId: taskCard.roomId,
+      content: '',
+    }];
+  };
+  const syntheticVisibleDrafts = (persistedThreadMessages) => {
+    if (!selectedTaskCardId) return [];
+    const taskCard = currentTaskCard();
+    if (!taskCard) return [];
+    if (taskCard.stage === 'discussion') return syntheticDiscussionDrafts(taskCard);
+    return syntheticExecutionHandoffDraft(taskCard, persistedThreadMessages);
+  };
   const visibleDrafts = () => {
     cleanupTypingDrafts();
+    const persistedThreadMessages = currentThreadMessages().filter((message) => {
+      if (selectedTaskCardId) return message.taskCardId === selectedTaskCardId;
+      return !message.taskCardId;
+    });
     const actualDrafts = Array.from(hallDrafts.values()).filter((draft) => {
       if (selectedTaskCardId) return draft.taskCardId === selectedTaskCardId;
       return !draft.taskCardId;
     });
-    const sourceDrafts = actualDrafts.length > 0 ? actualDrafts : syntheticVisibleDrafts();
+    const sourceDrafts = actualDrafts.length > 0 ? actualDrafts : syntheticVisibleDrafts(persistedThreadMessages);
     const deduped = new Map();
     sourceDrafts.forEach((draft) => {
       const key = draft.authorParticipantId || draft.authorLabel || draft.draftId;
@@ -946,14 +993,29 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
         deduped.set(key, draft);
       }
     });
-    return Array.from(deduped.values()).sort((a, b) => {
+    return Array.from(deduped.values()).filter((draft) => {
+      const persistedMessageId = String(draft.persistedMessageId || '').trim();
+      if (persistedMessageId && persistedThreadMessages.some((message) => String(message.messageId || '').trim() === persistedMessageId)) {
+        return false;
+      }
+      const authorId = String(draft.authorParticipantId || '').trim();
+      const draftCreatedAt = Date.parse(draft.createdAt || '') || 0;
+      if (!authorId || !draftCreatedAt) return true;
+      return !persistedThreadMessages.some((message) => {
+        const messageAuthorId = String(message.authorParticipantId || '').trim();
+        if (!messageAuthorId || messageAuthorId !== authorId) return false;
+        const messageCreatedAt = Date.parse(message.createdAt || '') || 0;
+        return messageCreatedAt >= draftCreatedAt;
+      });
+    }).sort((a, b) => {
       const aAt = Date.parse(a.createdAt || '') || 0;
       const bAt = Date.parse(b.createdAt || '') || 0;
       return aAt - bAt;
     });
   };
+  const visibleTypingDrafts = () => visibleDrafts().filter((draft) => !draft.settledAt);
   const participantPresence = (participantId) => {
-    const drafts = visibleDrafts();
+    const drafts = visibleTypingDrafts();
     if (drafts.some((draft) => draft.authorParticipantId === participantId)) {
       return { state: 'typing', label: textTypingNow, rank: 0 };
     }
@@ -983,7 +1045,7 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
   };
   const renderToolbarMetaNote = () => {
     if (!toolbarMetaNote) return;
-    const drafts = visibleDrafts();
+    const drafts = visibleTypingDrafts();
     if (drafts.length > 0) {
       const labels = drafts.slice(0, 2).map((draft) => draft.authorLabel || participantLabel(draft.authorParticipantId));
       toolbarMetaNote.textContent = drafts.length === 1
@@ -1008,13 +1070,13 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
       .map((value) => String(value || '').trim())
       .find(Boolean);
     if (!raw) return '';
-    const singleLine = raw.replace(/\s+/g, ' ').trim();
+    const singleLine = raw.replace(/\\s+/g, ' ').trim();
     const sentence = (singleLine.split(/[。！？.!?]/)[0] || '').trim();
     if (!sentence) return '';
     const title = String(taskCard?.title || '').trim();
     const stripped = sentence
       .replace(new RegExp('^' + title.replace(/[.*+?^$()|[\]\\]/g, '\\$&') + '[:：,，\\s-]*', 'i'), '')
-      .replace(/^(关于|针对|For|About)\s*/i, '')
+      .replace(/^(关于|针对|For|About)\\s*/i, '')
       .trim();
     if (!stripped) return '';
     return stripped.length > 34 ? stripped.slice(0, 34).trim() + '…' : stripped;
@@ -1514,7 +1576,42 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
         || /推进到可评审状态/.test(content)
         || /已经可评审了/.test(content);
     };
-    const visibleMessages = Array.isArray(messages) ? messages.filter((message) => !shouldHideStatusMessage(message)) : [];
+    const comparableMessageText = (content) => String(content || '')
+      .replace(/<br\\s*\\/?>/gi, '\\n')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/(^|[\\s(>\\[\\{<,.;:!?\\"'“”‘’，。！？；：、）】」』》])@([A-Za-z0-9_\\\\-\\u4e00-\\u9fff]+)/g, '$1')
+      .replace(/\\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+    const messagesSubstantiallyOverlap = (left, right) => {
+      if (!left || !right) return false;
+      const shorter = left.length <= right.length ? left : right;
+      const longer = left.length <= right.length ? right : left;
+      if (shorter.length >= 24 && longer.includes(shorter)) return true;
+      const prefixLength = Math.min(96, left.length, right.length);
+      return prefixLength >= 24 && left.slice(0, prefixLength) === right.slice(0, prefixLength);
+    };
+    const shouldHideSupersededOwnerStatus = (message, index, items) => {
+      if (!message || message.kind !== 'status') return false;
+      if (!message.authorParticipantId || message.authorParticipantId === 'operator' || message.authorParticipantId === 'system') return false;
+      const messageCreatedAt = Date.parse(message.createdAt || '') || 0;
+      if (!messageCreatedAt) return false;
+      const comparable = comparableMessageText(message.content);
+      if (comparable.length < 24) return false;
+      return items.some((candidate, candidateIndex) => {
+        if (candidateIndex === index || !candidate || candidate.kind !== 'handoff') return false;
+        if (candidate.authorParticipantId !== message.authorParticipantId) return false;
+        if (String(candidate.taskCardId || '') !== String(message.taskCardId || '')) return false;
+        const candidateCreatedAt = Date.parse(candidate.createdAt || '') || 0;
+        if (!candidateCreatedAt || Math.abs(candidateCreatedAt - messageCreatedAt) > 45_000) return false;
+        return messagesSubstantiallyOverlap(comparable, comparableMessageText(candidate.content));
+      });
+    };
+    const visibleMessages = Array.isArray(messages)
+      ? messages
+        .filter((message) => !shouldHideStatusMessage(message))
+        .filter((message, index, items) => !shouldHideSupersededOwnerStatus(message, index, items))
+      : [];
     const renderedMessages = visibleMessages.map((message, index) => {
       const authorType = message.authorParticipantId === 'operator'
         ? 'operator'
@@ -1554,7 +1651,7 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
 
   const renderTypingStrip = () => {
     if (!typingStrip) return;
-    const drafts = visibleDrafts();
+    const drafts = visibleTypingDrafts();
     if (drafts.length === 0) {
       typingStrip.innerHTML = '';
       typingStrip.hidden = true;
@@ -1860,7 +1957,15 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
         return;
       }
       if ((event.type === 'draft_complete' || event.type === 'draft_abort') && event.draftId) {
-        hallDrafts.delete(event.draftId);
+        const draft = hallDrafts.get(event.draftId);
+        if (event.type === 'draft_complete' && draft) {
+          draft.settledAt = event.createdAt || new Date().toISOString();
+          draft.lastDeltaAt = event.createdAt || new Date().toISOString();
+          draft.persistedMessageId = event.messageId || '';
+          hallDrafts.set(event.draftId, draft);
+        } else {
+          hallDrafts.delete(event.draftId);
+        }
         renderVisibleThread();
         if (event.type === 'draft_complete') {
           scheduleHallReload();
@@ -2732,8 +2837,44 @@ function renderHallMessages(messages: HallMessage[], language: UiLanguage): stri
       /推进到可评审状态/.test(content) ||
       /已经可评审了/.test(content);
   };
+  const comparableMessageText = (content: string | undefined): string => String(content || "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/(^|[\s(>\[\{<,.;:!?"'“”‘’，。！？；：、）】」』》])@([A-Za-z0-9_\-\u4e00-\u9fff]+)/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  const messagesSubstantiallyOverlap = (left: string, right: string): boolean => {
+    if (!left || !right) return false;
+    const shorter = left.length <= right.length ? left : right;
+    const longer = left.length <= right.length ? right : left;
+    if (shorter.length >= 24 && longer.includes(shorter)) return true;
+    const prefixLength = Math.min(96, left.length, right.length);
+    return prefixLength >= 24 && left.slice(0, prefixLength) === right.slice(0, prefixLength);
+  };
+  const shouldHideSupersededOwnerStatus = (
+    message: HallMessage,
+    index: number,
+    items: HallMessage[],
+  ): boolean => {
+    if (message.kind !== "status") return false;
+    if (!message.authorParticipantId || message.authorParticipantId === "operator" || message.authorParticipantId === "system") return false;
+    const messageCreatedAt = Date.parse(message.createdAt || "") || 0;
+    if (!messageCreatedAt) return false;
+    const comparable = comparableMessageText(message.content);
+    if (comparable.length < 24) return false;
+    return items.some((candidate, candidateIndex) => {
+      if (candidateIndex === index || candidate.kind !== "handoff") return false;
+      if (candidate.authorParticipantId !== message.authorParticipantId) return false;
+      if ((candidate.taskCardId || "") !== (message.taskCardId || "")) return false;
+      const candidateCreatedAt = Date.parse(candidate.createdAt || "") || 0;
+      if (!candidateCreatedAt || Math.abs(candidateCreatedAt - messageCreatedAt) > 45_000) return false;
+      return messagesSubstantiallyOverlap(comparable, comparableMessageText(candidate.content));
+    });
+  };
   return messages
     .filter((message) => !shouldHideStatusMessage(message))
+    .filter((message, index, items) => !shouldHideSupersededOwnerStatus(message, index, items))
     .map((message) => {
       const authorType = message.authorParticipantId === "operator"
         ? "operator"

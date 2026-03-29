@@ -1449,6 +1449,13 @@ function getCurrentExecutionItem(taskCard: HallTaskCard): HallExecutionItem | un
   return findExecutionItemForParticipant(taskCard, taskCard.currentOwnerParticipantId);
 }
 
+function getExpectedNextExecutionOwner(taskCard: HallTaskCard): string | undefined {
+  const currentExecutionItem = getCurrentExecutionItem(taskCard);
+  return currentExecutionItem?.handoffToParticipantId?.trim()
+    || taskCard.plannedExecutionOrder[0]?.trim()
+    || undefined;
+}
+
 function summarizeExecutionItemTask(
   taskCard: HallTaskCard,
   participantId: string | undefined,
@@ -2102,8 +2109,8 @@ export async function recordHallTaskHandoff(
   const handoffSummary = summarizeStructuredHandoff(handoff, {
     language: inferHallResponseLanguage(`${taskCard.title}\n${taskCard.description}\n${taskCard.latestSummary ?? ""}`),
   });
-  const queuedNextOwner = taskCard.plannedExecutionOrder[0];
-  const handoffMatchesQueue = !queuedNextOwner || queuedNextOwner === toParticipant.participantId;
+  const expectedNextOwnerParticipantId = getExpectedNextExecutionOwner(taskCard);
+  const handoffMatchesQueue = !expectedNextOwnerParticipantId || expectedNextOwnerParticipantId === toParticipant.participantId;
 
   taskCard = releaseHallExecutionLock(taskCard, `handoff:${toParticipant.participantId}`);
   taskCard = (
@@ -2146,8 +2153,8 @@ export async function recordHallTaskHandoff(
   });
 
   const generatedMessages: HallMessage[] = [];
-  if (!handoffMatchesQueue && queuedNextOwner) {
-    const expected = findParticipant(context.hall.participants, queuedNextOwner)?.displayName ?? queuedNextOwner;
+  if (!handoffMatchesQueue && expectedNextOwnerParticipantId) {
+    const expected = findParticipant(context.hall.participants, expectedNextOwnerParticipantId)?.displayName ?? expectedNextOwnerParticipantId;
     generatedMessages.push(await appendHallSystemMessage({
       hallId: context.hall.hallId,
       projectId: taskCard.projectId,
@@ -2164,21 +2171,45 @@ export async function recordHallTaskHandoff(
       },
     }));
   }
-  const shouldAutoDispatchToNextOwner = handoffMatchesQueue || !queuedNextOwner;
+  const shouldAutoDispatchToNextOwner = handoffMatchesQueue || !expectedNextOwnerParticipantId;
   if (shouldAutoDispatchToNextOwner && canDispatchHallToRuntime(options.toolClient, toParticipant)) {
-    const chain = await runHallRuntimeExecutionChain({
-      hall: context.hall,
-      taskCard,
-      participant: toParticipant,
-      task: patchedTask.task,
-      toolClient: options.toolClient!,
-      mode: "handoff",
-      handoff,
-      targetParticipantIds: [toParticipant.participantId],
+    const placeholderDraftId = beginHallDraftReply({
+      hallId: context.hall.hallId,
+      taskCardId: taskCard.taskCardId,
+      projectId: taskCard.projectId,
+      taskId: taskCard.taskId,
+      roomId: taskCard.roomId,
+      authorParticipantId: toParticipant.participantId,
+      authorLabel: toParticipant.displayName,
+      authorSemanticRole: toParticipant.semanticRole,
+      messageKind: "handoff",
+      content: "",
     });
-    taskCard = chain.taskCard;
-    if (chain.task) patchedTask = { ...patchedTask, task: chain.task };
-    generatedMessages.push(...chain.generatedMessages);
+    try {
+      const chain = await runHallRuntimeExecutionChain({
+        hall: context.hall,
+        taskCard,
+        participant: toParticipant,
+        task: patchedTask.task,
+        toolClient: options.toolClient!,
+        mode: "handoff",
+        handoff,
+        targetParticipantIds: [toParticipant.participantId],
+      });
+      taskCard = chain.taskCard;
+      if (chain.task) patchedTask = { ...patchedTask, task: chain.task };
+      generatedMessages.push(...chain.generatedMessages);
+    } finally {
+      abortHallDraftReply({
+        hallId: context.hall.hallId,
+        taskCardId: taskCard.taskCardId,
+        projectId: taskCard.projectId,
+        taskId: taskCard.taskId,
+        roomId: taskCard.roomId,
+        draftId: placeholderDraftId,
+        reason: "handoff_runtime_started",
+      });
+    }
   } else {
     const handoffMessage = await appendStreamedGeneratedHallMessage({
       hallId: context.hall.hallId,
@@ -2516,7 +2547,7 @@ function determineDiscussionTurnParticipants(input: {
   };
 
   const lead = nonManagers[0] ?? manager;
-  const complement = pickComplementaryDiscussionParticipant(nonManagers, lead, input.taskCard, input.task)
+  const complement = pickComplementaryDiscussionParticipant(nonManagers, lead)
     ?? nonManagers[1];
 
   if (explicitTargets.length > 0 && wantsConcreteDeliverable) {
@@ -2633,21 +2664,36 @@ function classifyHallDiscussionFollowupIntent(
   text: string,
 ): "discussion_request" | "direct_deliverable_request" | "repo_scan_request" | "review_request" | "decision_request" {
   const normalized = text.trim();
+  const normalizedIntentSource = normalizeHallIntentSourceText(normalized);
   if (!normalized) return "discussion_request";
   if (requestsDiscussionContinuation(normalized)) return "discussion_request";
   if (/(收一下|收个口|给个结论|拍板|定一下|做决定|作决定|第一执行者|建议第一位执行者|先给.*第一步|给.*第一步|谁先做|谁来做第一步|谁来先做|执行顺序|下一步由谁|谁负责|owner|executor|decision|wrap up|summari[sz]e)/i.test(normalized)) {
     return "decision_request";
   }
-  if (/(repo|repository|codebase|source code|scan code|scan the repo|implementation|file path|workspace|代码|源码|仓库|扫描代码|扫代码|实现|文件)/i.test(normalized)) {
+  if (looksLikeRepoInspectionRequest(normalizedIntentSource)) {
     return "repo_scan_request";
   }
   if (/(must-fix|review|审核|评审|检查|挑一下|挑出|只挑|硬问题|硬缺口)/i.test(normalized)) {
     return "review_request";
   }
-  if (/(给我|给一下|直接给|你给|你来|你去|请你|帮我|直接出|出一下|写一下|写一版|给一版|直接贴|贴一下|去扫|扫一下|看一下|查一下|产出|生成|整理|总结|扫描|scan|inspect|check|review|write|draft|produce|generate|show me|give me|please give|please write|please scan|can you|could you|完整的?.*(开头|口播|脚本|文案|版本)|三个?.*(开头|视频开头|口播开头)|3 个.*(开头|视频开头|口播开头|hook|thumbnail))/i.test(normalized)) {
+  if (/(给我|给一下|直接给|你给|你来|你去|请你|帮我|直接出|出一下|写一下|写一版|给一版|直接贴|贴一下|去扫|扫一下|看一下|查一下|产出|生成|整理|总结|扫描|优化|改一下|改一版|改版|再优化|减字|加图|加一些图|润色|收紧|scan|inspect|check|review|write|draft|produce|generate|optimize|revise|polish|tighten|show me|give me|please give|please write|please scan|can you|could you|完整的?.*(开头|口播|脚本|文案|版本)|三个?.*(开头|视频开头|口播开头)|3 个.*(开头|视频开头|口播开头|hook|thumbnail))/i.test(normalized)) {
     return "direct_deliverable_request";
   }
   return "discussion_request";
+}
+
+function normalizeHallIntentSourceText(text: string): string {
+  return String(text || "")
+    .replace(/file:\/\/\/\S+/gi, " ")
+    .replace(/\bhttps?:\/\/\S+\.(?:html?|png|jpe?g|gif|webp|svg)(?:[?#]\S*)?/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function looksLikeRepoInspectionRequest(text: string): boolean {
+  const normalized = normalizeHallIntentSourceText(text);
+  if (!normalized) return false;
+  return /(repo|repository|codebase|source code|scan code|scan the repo|implementation|file path|source file|entry file|看代码|看仓库|查仓库|扫描代码|扫代码|源码|仓库|实现|入口文件|文件路径|哪个文件|哪些文件)/i.test(normalized);
 }
 
 function requestsConcreteDeliverable(text: string): boolean {
@@ -2672,12 +2718,9 @@ function countDistinctAgentContributors(messages: HallMessage[], openedAt?: stri
 function pickComplementaryDiscussionParticipant(
   candidates: HallParticipant[],
   lead: HallParticipant | undefined,
-  taskCard: HallTaskCard,
-  task?: ProjectTask,
 ): HallParticipant | undefined {
   if (!lead) return candidates[1];
-  const domain = inferHallDiscussionDomain(taskCard, task);
-  const preferredRoles = complementaryDiscussionRoles(lead.semanticRole, domain);
+  const preferredRoles = complementaryDiscussionRoles(lead.semanticRole);
   for (const role of preferredRoles) {
     const match = candidates.find((participant) => participant.participantId !== lead.participantId && participant.semanticRole === role);
     if (match) return match;
@@ -2687,10 +2730,8 @@ function pickComplementaryDiscussionParticipant(
 
 function complementaryDiscussionRoles(
   leadRole: HallSemanticRole,
-  domain: HallDiscussionDomain,
 ): HallSemanticRole[] {
   if (leadRole === "planner") {
-    if (domain === "research" || domain === "product" || domain === "operations") return ["reviewer", "coder", "generalist"];
     return ["coder", "reviewer", "generalist"];
   }
   if (leadRole === "coder") return ["reviewer", "planner", "generalist"];
@@ -2898,9 +2939,7 @@ async function applyHallExecutionDirective(input: {
   const latestHall = await requireHall(input.hall.hallId);
   const latestTaskCard = await requireTaskCard(input.taskCard.taskCardId);
   const currentExecutionItem = getCurrentExecutionItem(latestTaskCard);
-  const queuedNextParticipantId = currentExecutionItem
-    ? (currentExecutionItem.handoffToParticipantId?.trim() || "")
-    : (latestTaskCard.plannedExecutionOrder[0] || "");
+  const queuedNextParticipantId = getExpectedNextExecutionOwner(latestTaskCard) || "";
   if (!nextAction || nextAction === "continue") {
     return { taskCard: latestTaskCard, task: input.task, generatedMessages: [] };
   }
@@ -3014,9 +3053,7 @@ async function applyHallExecutionDirective(input: {
   }
 
   if (nextAction === "handoff") {
-    const plannedNextParticipantId = currentExecutionItem
-      ? (currentExecutionItem.handoffToParticipantId?.trim() || "")
-      : (latestTaskCard.plannedExecutionOrder[0] || "");
+    const plannedNextParticipantId = getExpectedNextExecutionOwner(latestTaskCard) || "";
     const explicitNextParticipant = input.directive?.executor
       ? findParticipant(latestHall.participants, input.directive.executor)
       : undefined;
@@ -3128,20 +3165,7 @@ async function appendGeneratedHallReply(
 
   let runtimeResult: HallRuntimeDispatchResult | undefined;
   let failureMessage: HallMessage | undefined;
-  let runtimeDraftId = "";
   if (canDispatchHallToRuntime(toolClient, participant)) {
-    runtimeDraftId = beginHallDraftReply({
-      hallId: hall.hallId,
-      taskCardId: taskCard.taskCardId,
-      projectId: taskCard.projectId,
-      taskId: taskCard.taskId,
-      roomId: taskCard.roomId,
-      authorParticipantId: participant.participantId,
-      authorLabel: participant.displayName,
-      authorSemanticRole: participant.semanticRole,
-      messageKind: participant.semanticRole === "manager" ? "decision" : "proposal",
-      content: "",
-    });
     try {
       const recentThreadMessages = await loadRecentHallThreadMessages(taskCard);
       runtimeResult = await dispatchHallRuntimeTurn({
@@ -3202,31 +3226,6 @@ async function appendGeneratedHallReply(
           roomId: taskCard.roomId,
           payload: draft.payload,
       }));
-
-  if (runtimeDraftId) {
-    if (message) {
-      completeHallDraftReply({
-        hallId: hall.hallId,
-        taskCardId: taskCard.taskCardId,
-        projectId: taskCard.projectId,
-        taskId: taskCard.taskId,
-        roomId: taskCard.roomId,
-        draftId: runtimeDraftId,
-        messageId: message.messageId,
-        content: message.content,
-      });
-    } else {
-      abortHallDraftReply({
-        hallId: hall.hallId,
-        taskCardId: taskCard.taskCardId,
-        projectId: taskCard.projectId,
-        taskId: taskCard.taskId,
-        roomId: taskCard.roomId,
-        draftId: runtimeDraftId,
-        reason: "discussion_reply_not_persisted",
-      });
-    }
-  }
 
   if (!message) {
     return { taskCard };
@@ -3581,7 +3580,6 @@ function buildGeneratedHallReply(
 ): { kind: HallMessage["kind"]; content: string; payload?: HallMessage["payload"] } {
   const language = inferHallResponseLanguage(`${taskCard.title}\n${taskCard.description}\n${task?.title ?? ""}`);
   const title = taskCard.title;
-  const domain = inferHallDiscussionDomain(taskCard, task);
   if (taskCard.stage === "execution") {
     return {
       kind: "status",
@@ -3610,7 +3608,7 @@ function buildGeneratedHallReply(
     };
   }
   if (participant.semanticRole === "planner") {
-    const proposal = buildPlannerDiscussionProposal(taskCard, domain, language);
+    const proposal = buildPlannerDiscussionProposal(taskCard, language);
     return {
       kind: "proposal",
       content: proposal,
@@ -3622,7 +3620,7 @@ function buildGeneratedHallReply(
     };
   }
   if (participant.semanticRole === "coder") {
-    const proposal = buildImplementerDiscussionProposal(taskCard, domain, language);
+    const proposal = buildImplementerDiscussionProposal(taskCard, language);
     return {
       kind: "proposal",
       content: proposal,
@@ -3634,7 +3632,7 @@ function buildGeneratedHallReply(
     };
   }
   if (participant.semanticRole === "reviewer") {
-    const proposal = buildReviewerDiscussionProposal(taskCard, domain, language);
+    const proposal = buildReviewerDiscussionProposal(taskCard, language);
     return {
       kind: "proposal",
       content: proposal,
@@ -3650,7 +3648,7 @@ function buildGeneratedHallReply(
     const suggestedPlan = buildSuggestedExecutionPlan(hall, taskCard, executor.participantId, task);
     const executionOrder = suggestedPlan.executionOrder;
     const executionItems = suggestedPlan.executionItems;
-    const decision = buildManagerDiscussionDecision(taskCard, domain, executor.displayName, language);
+    const decision = buildManagerDiscussionDecision(taskCard, executor.displayName, language);
     const preservedProposal = taskCard.proposal?.trim()
       || taskCard.latestSummary?.trim()
       || (language === "zh"
@@ -3658,7 +3656,7 @@ function buildGeneratedHallReply(
         : `Turn this discussion about "${title}" into an executable first plan.`);
     const doneWhen = task?.definitionOfDone.length
       ? task.definitionOfDone.join("; ")
-      : buildSuggestedDoneWhen(taskCard, domain, language);
+      : buildSuggestedDoneWhen(taskCard, language);
     const actionSummary = executionItems.map((item, index) => {
       const participantLabel = findParticipant(hall.participants, item.participantId)?.displayName ?? item.participantId;
       const nextLabel = item.handoffToParticipantId
@@ -3701,162 +3699,42 @@ function inferHallDiscussionDomain(taskCard: HallTaskCard, task: ProjectTask | u
   return inferHallDiscussionDomainFromText(`${taskCard.title}\n${taskCard.description}\n${task?.title ?? ""}`);
 }
 
-function buildPlannerDiscussionProposal(taskCard: HallTaskCard, domain: HallDiscussionDomain, language: HallResponseLanguage): string {
+function buildPlannerDiscussionProposal(taskCard: HallTaskCard, language: HallResponseLanguage): string {
   const title = taskCard.title;
   if (language === "zh") {
-    if (domain === "creative") return `关于“${title}”，我想先锁定 brief：目标受众、核心信息、风格边界、输出形式，以及第一版能否成立的样片长什么样。我的建议是把它当成一个创意制作任务：brief -> 分镜 -> 第一版动画样片。`;
-    if (domain === "analysis") return `关于“${title}”，我想先澄清我们要回答什么问题、面向谁、数据从哪里来，以及最终需要交付什么样的产物。先在大厅里把叙事和输出形态对齐，再决定谁去做第一版。`;
-    if (domain === "product") return `关于“${title}”，我想先钉住用户问题、成功标准、约束，以及最小但有意义的第一步。我们先在大厅里把范围说清楚，再指派一个 owner 做第一版。`;
-    if (domain === "research") return `关于“${title}”，我想先定义研究问题、需要的证据、预期深度，以及最后要形成什么结论。先把调查视角和结构对齐，再安排采集、整理和审核顺序。`;
-    if (domain === "operations") return `关于“${title}”，我想先澄清流程、相关方、交接点和潜在失效点。先在大厅里把执行路径讲清楚，再指派一个 owner 驱动第一段。`;
-    if (domain === "engineering") return `关于“${title}”，我想先澄清目标、约束、接口和最小可落地切片。先在大厅里把范围收口，再指派一个 owner 做第一版实现。`;
-    return `关于“${title}”，我想先澄清目标、受众、约束，以及“完成”到底意味着什么。先在大厅里把事情说透，再安排第一位执行者。`;
+    return `关于“${title}”，我想先把这件事说直白：这次最想让人一眼看懂什么，第一版最小要证明什么，以及先拿哪个具体例子来证明它。先把目标、受众和第一版边界说清楚，再决定谁去做第一步。`;
   }
-  if (domain === "creative") {
-    return `For "${title}", I want to lock the brief before execution: audience, message, style boundary, output format, and what a first convincing motion sample looks like. I suggest we treat this as a creative-production task: brief -> storyboard -> first animation pass.`;
-  }
-  if (domain === "analysis") {
-    return `For "${title}", I want to clarify the question we are answering, the audience, the data sources, and the artifact we need to deliver. I suggest we align on the narrative and the final output shape before anyone starts building.`;
-  }
-  if (domain === "product") {
-    return `For "${title}", I want to pin down the user problem, success criteria, constraints, and the smallest plan that moves the decision forward. We should align the scope in the hall first, then choose one execution owner for the first pass.`;
-  }
-  if (domain === "research") {
-    return `For "${title}", I want to define the research question, evidence we need, depth expected, and what kind of conclusion will be useful. I suggest we agree on the investigation lens first, then sequence collection, synthesis, and review.`;
-  }
-  if (domain === "operations") {
-    return `For "${title}", I want to clarify the workflow, stakeholders, handoff points, and failure modes before execution starts. We should first agree on the operating path in the hall, then assign one owner to drive the first slice.`;
-  }
-  if (domain === "engineering") {
-    return `For "${title}", I want to clarify the outcome, constraints, interfaces, and the smallest safe slice before execution starts. We should align the scope in the hall first, then assign one owner for the first implementation pass.`;
-  }
-  return `For "${title}", I want to clarify the outcome, audience, constraints, and what “done” means before anyone executes. We should use this hall discussion to scope the work, then assign one owner for the first concrete pass.`;
+  return `For "${title}", I want to make the goal concrete first: what the audience should understand immediately, what the smallest first proof looks like, and which example will make that obvious. We should clarify the goal, audience, and first-pass boundary before assigning the first owner.`;
 }
 
-function buildImplementerDiscussionProposal(taskCard: HallTaskCard, domain: HallDiscussionDomain, language: HallResponseLanguage): string {
+function buildImplementerDiscussionProposal(taskCard: HallTaskCard, language: HallResponseLanguage): string {
   const title = taskCard.title;
   if (language === "zh") {
-    if (domain === "creative") return `“${title}”比较务实的执行路径是：把 brief 转成分镜，选定视觉语言，做一小段 animatic 或 motion sample，再根据反馈迭代。这样第一版就能形成一个可评审的交付物，而不是一开始就把全片做满。`;
-    if (domain === "analysis") return `“${title}”比较务实的执行路径是：先确认可信数据，快速搭叙事，再做一个轻量可视化原型，然后根据故事是否成立和是否符合受众来迭代。`;
-    if (domain === "product") return `“${title}”比较务实的执行路径是：先把讨论沉淀成一个短计划，再做一个具体的草稿或原型，用它验证方向，再决定是否扩 scope。这样第一位 owner 会很清楚自己要交什么。`;
-    if (domain === "research") return `“${title}”比较务实的执行路径是：先拿到最小可用的证据集，再把模式整理出来，最后转换成清晰建议。第一位 owner 应该留下可分享的综合结论，而不是一堆原始笔记。`;
-    if (domain === "operations") return `“${title}”比较务实的执行路径是：先画出当前流程，提出下一版流程，再验证最容易出问题的 handoff。这样第一段执行就会足够小，也便于观察。`;
-    if (domain === "engineering") return `“${title}”比较务实的执行路径是：先选最小可交付切片，端到端做通一遍，把证据和细节放进关联线程。这样一个 owner 就能快速前进，又不会丢可追踪性。`;
-    return `“${title}”比较务实的执行路径是：先做一个能证明方向的具体产物，再根据讨论反馈继续迭代。第一位 owner 要交付的是“可评审的第一版”，不是一次性做到底。`;
+    return `“${title}”更务实的推进方式是：先拿一个最小但能说明问题的具体例子，把第一版直接做成能被看、被比、被改的东西。先别一次铺太大，先让大家看到这件事到底值不值得继续做。`;
   }
-  if (domain === "creative") {
-    return `A practical execution path for "${title}" is: turn the brief into a storyboard, pick a visual language, make one short animatic or motion sample, then iterate after feedback. That gives us a concrete first deliverable without overcommitting the whole production.`;
-  }
-  if (domain === "analysis") {
-    return `A practical execution path for "${title}" is: confirm the data we can trust, sketch the narrative, build one lightweight prototype of the visualization, then refine it after we validate the story and audience fit.`;
-  }
-  if (domain === "product") {
-    return `A practical execution path for "${title}" is: turn the discussion into a short plan, create one tangible draft or prototype, and use that to validate the direction before expanding scope. That keeps the first owner focused on one concrete deliverable.`;
-  }
-  if (domain === "research") {
-    return `A practical execution path for "${title}" is: collect the minimum viable evidence set, summarize the patterns, and convert that into a clear recommendation. The first owner should leave behind a shareable synthesis, not just raw notes.`;
-  }
-  if (domain === "operations") {
-    return `A practical execution path for "${title}" is: map the current workflow, propose the next-state flow, and validate the first risky handoff before rolling the whole process out. That keeps the first execution slice small and observable.`;
-  }
-  if (domain === "engineering") {
-    return `A practical execution path for "${title}" is: choose the smallest shippable slice, implement it end to end, and keep details or evidence in the linked thread. That lets one owner move quickly without losing traceability.`;
-  }
-  return `A practical execution path for "${title}" is: create one concrete first deliverable that proves the direction, then iterate after discussion feedback. The first owner should focus on something reviewable, not boil the ocean.`;
+  return `A practical way to move "${title}" forward is to pick one small but revealing example and turn it into a reviewable first pass. Start with something people can see, compare, and react to instead of trying to solve the whole thing at once.`;
 }
 
-function buildReviewerDiscussionProposal(taskCard: HallTaskCard, domain: HallDiscussionDomain, language: HallResponseLanguage): string {
+function buildReviewerDiscussionProposal(taskCard: HallTaskCard, language: HallResponseLanguage): string {
   const title = taskCard.title;
   if (language === "zh") {
-    if (domain === "creative") return `我这边的审视重点是：受众、视觉调性、时长和审核节点是否已经明确；第一版是不是有过度展开的风险；以及什么样的反馈才算方向验证通过。`;
-    if (domain === "analysis") return `我这边的审视重点是：数据是否可靠、叙事是否诚实、受众是否能看懂，以及选定的交付物是否真的能支撑我们要做的判断。`;
-    if (domain === "product") return `我这边的审视重点是：我们是不是在解决正确的问题、第一版范围是否足够小，以及有哪些依赖或假设会让这一步失效。`;
-    if (domain === "research") return `我这边的审视重点是：问题是否足够尖锐、证据计划是否可信，以及产出是否会形成可用结论，而不是只堆一堆观察。`;
-    if (domain === "operations") return `我这边的审视重点是：流程会卡在哪、哪些 handoff 最容易掉链子，以及哪些责任或审批必须先说清楚。`;
-    if (domain === "engineering") return `我这边的审视重点是：scope 控制、回归风险、owner 边界，以及第一版是不是足够小，能不能被干净地评审。`;
-    return `我这边的审视重点是：范围是否清楚、有哪些隐藏假设、谁需要评审第一版，以及当前提出的第一步是否已经足够具体。`;
+    return `我这边最在意的是：这件事现在是不是已经说到了用户真正关心的点，第一版范围是不是够小够清楚，以及做出来之后别人能不能一眼判断它有没有打到点上。`;
   }
-  if (domain === "creative") {
-    return `Review focus for "${title}": are we clear on audience, visual tone, duration, and approval checkpoints; are we about to over-scope the first pass; and do we know what feedback would validate the direction?`;
-  }
-  if (domain === "analysis") {
-    return `Review focus for "${title}": are the data sources reliable, is the narrative honest, will the audience understand the output, and are we choosing a deliverable that can actually support the decision we care about?`;
-  }
-  if (domain === "product") {
-    return `Review focus for "${title}": are we solving the right user problem, is the scope small enough for one owner, and what dependencies or assumptions could invalidate the proposed first step?`;
-  }
-  if (domain === "research") {
-    return `Review focus for "${title}": are the questions sharp enough, is the evidence plan credible, and is the output likely to produce a usable conclusion instead of a pile of observations?`;
-  }
-  if (domain === "operations") {
-    return `Review focus for "${title}": where can the workflow stall, who can be blocked by a bad handoff, and what needs explicit ownership or approval before we say the first slice is done?`;
-  }
-  if (domain === "engineering") {
-    return `Review focus for "${title}": scope control, regression risk, ownership boundaries, and whether the first pass is small enough to review cleanly before it expands.`;
-  }
-  return `Review focus for "${title}": scope clarity, hidden assumptions, who needs to review the first deliverable, and whether the proposed first pass is concrete enough to evaluate.`;
+  return `My review lens for "${title}" is simple: are we actually answering the user's goal, is the first pass small and concrete enough, and will people be able to judge quickly whether it works?`;
 }
 
-function buildManagerDiscussionDecision(taskCard: HallTaskCard, domain: HallDiscussionDomain, executorLabel: string, language: HallResponseLanguage): string {
+function buildManagerDiscussionDecision(taskCard: HallTaskCard, executorLabel: string, language: HallResponseLanguage): string {
   if (language === "zh") {
-    if (domain === "creative") return `我们应该先在大厅里把 brief 锁住，再把第一段创意制作交给 ${executorLabel}。第一位 owner 的目标不是一次做完整，而是拿出可评审的分镜或 motion sample。`;
-    if (domain === "analysis") return `我们应该先在大厅里把叙事和输出形式对齐，再把第一段分析或原型交给 ${executorLabel}。第一版的目标是形成可评审的可视化方向，而不是最后成片。`;
-    if (domain === "product") return `我们应该先在大厅里把问题、范围和成功标准收口，再让 ${executorLabel} 去完成第一版可落地方案。第一段执行应该足够小，能快速被评审。`;
-    if (domain === "research") return `我们应该先在大厅里把研究问题和证据标准定清楚，再让 ${executorLabel} 去推动第一轮采集与整理。第一版要交的是能支撑决策的综合判断。`;
-    if (domain === "operations") return `我们应该先在大厅里把流程、交接和审批说透，再让 ${executorLabel} 去跑第一段受控流程。这样更容易看见阻塞点和责任边界。`;
-    if (domain === "engineering") return `我们应该先在大厅里把范围和接口收口，再让 ${executorLabel} 做第一版最小可交付切片。先把端到端一条链跑通，再扩展。`;
-    return `我们应该先在大厅里把目标、约束和执行方式对齐，再让 ${executorLabel} 做第一版具体产物。先拿到一个可评审的结果，再决定后续扩展。`;
+    return `先把这一轮讨论收成一个明确目标，再把第一版最小可评审结果交给 ${executorLabel}。第一棒不要做满，先做出一个能直接说明方向的结果，再继续往下推。`;
   }
-  if (domain === "creative") {
-    return `We should keep this in discussion long enough to lock the brief, then move the first creative-production pass to ${executorLabel}. The first owner should produce a reviewable storyboard or motion sample instead of trying to finish the whole piece at once.`;
-  }
-  if (domain === "analysis") {
-    return `We should align the narrative and output shape here in the hall, then move the first analysis or prototype pass to ${executorLabel}. The goal of that first pass is a reviewable visualization direction, not final polish.`;
-  }
-  if (domain === "product") {
-    return `We should settle the goal and first deliverable in the hall, then hand the initial execution slice to ${executorLabel}. That first pass should validate direction quickly before the scope widens.`;
-  }
-  if (domain === "research") {
-    return `We should align on the investigation lens here, then hand the first evidence-collection and synthesis pass to ${executorLabel}. The first owner should return with a reviewable recommendation, not just raw material.`;
-  }
-  if (domain === "operations") {
-    return `We should agree on the workflow and handoff points here, then move the first operational pass to ${executorLabel}. The first owner should validate one controlled slice before we scale the process.`;
-  }
-  if (domain === "engineering") {
-    return `We should keep the decision in the hall, assign the first focused implementation slice to ${executorLabel}, and continue using the linked thread only for detail and evidence.`;
-  }
-  return `We should settle the direction in the hall, move the first focused execution slice to ${executorLabel}, and keep the rest of the team in review and handoff roles until the first deliverable lands.`;
+  return `We should settle the goal of this discussion, then hand the smallest reviewable first pass to ${executorLabel}. The first owner should prove direction quickly instead of trying to finish everything at once.`;
 }
 
-function buildSuggestedDoneWhen(taskCard: HallTaskCard, domain: HallDiscussionDomain, language: HallResponseLanguage): string {
+function buildSuggestedDoneWhen(taskCard: HallTaskCard, language: HallResponseLanguage): string {
   if (language === "zh") {
-    if (domain === "creative") return `针对“${taskCard.title}”，需要有明确受众、核心叙事、风格方向，以及一版可评审的分镜或动画样片。`;
-    if (domain === "analysis") return `针对“${taskCard.title}”，需要有可信数据范围、清楚叙事、第一版可评审可视化方向，以及下一步迭代建议。`;
-    if (domain === "product") return `针对“${taskCard.title}”，需要有明确的问题定义、第一版行动方案或原型，以及对下一步验证路径的清楚说明。`;
-    if (domain === "research") return `针对“${taskCard.title}”，需要有研究问题、关键证据、综合结论，以及下一步建议。`;
-    if (domain === "operations") return `针对“${taskCard.title}”，需要有清楚的流程设计、关键责任边界、第一段试运行结果，以及后续调整建议。`;
-    if (domain === "engineering") return `针对“${taskCard.title}”，需要有一条端到端可运行的第一版、必要证据，以及明确的下一步实现计划。`;
-    return `针对“${taskCard.title}”，需要有一个可评审的第一版结果、明确的完成标准，以及清楚的下一步。`;
+    return `针对“${taskCard.title}”，需要有一个别人一眼就能看懂的第一版结果、明确 owner、明确 next action，以及能继续往下推进的下一棒。`;
   }
-  if (domain === "creative") {
-    return `the brief is clear, a first storyboard or motion sample exists, and the hall has agreed on the next production step for "${taskCard.title}"`;
-  }
-  if (domain === "analysis") {
-    return `there is a reviewable data narrative, a first visualization direction, and a clear next step for refining "${taskCard.title}"`;
-  }
-  if (domain === "product") {
-    return `the goal, first deliverable, and owner sequence are clear, and the first pass for "${taskCard.title}" is ready for review`;
-  }
-  if (domain === "research") {
-    return `the key question is answered with enough evidence to recommend a next move for "${taskCard.title}"`;
-  }
-  if (domain === "operations") {
-    return `the first workflow slice for "${taskCard.title}" has a clear owner, observable result, and known next handoff`;
-  }
-  if (domain === "engineering") {
-    return `the first implementation slice for "${taskCard.title}" is complete, reviewable, and its evidence is linked back into the hall`;
-  }
-  return `the first focused deliverable for "${taskCard.title}" is reviewable, the next owner is clear, and the hall has a concrete next step`;
+  return `there is a reviewable first result for "${taskCard.title}", a clear owner, a clear next action, and the next handoff can continue without guesswork`;
 }
 
 function inferHallResponseLanguage(source: string | undefined): HallResponseLanguage {
@@ -3888,7 +3766,6 @@ function buildDynamicDiscussionParticipantQueue(
   task?: ProjectTask,
   triggerText?: string,
 ): string[] {
-  const domain = inferHallDiscussionDomain(taskCard, task);
   const normalizedTrigger = triggerText ?? `${taskCard.title}\n${taskCard.description}`;
   const wantsContinuation = requestsDiscussionContinuation(normalizedTrigger);
   const wantsDecision =
@@ -3910,7 +3787,7 @@ function buildDynamicDiscussionParticipantQueue(
   for (const participantId of [...taskCard.mentionedParticipantIds, ...taskCard.requiresInputFrom]) {
     push(participantId);
   }
-  for (const role of discussionRoleOrderForDomain(domain).filter((role) => wantsDecision || role !== "manager")) {
+  for (const role of discussionRoleOrder().filter((role) => wantsDecision || role !== "manager")) {
     push(pickParticipantForRole(hall.participants, role)?.participantId);
   }
   if (wantsDecision) {
@@ -3928,14 +3805,8 @@ function buildDynamicDiscussionParticipantQueue(
   return ordered.slice(0, wantsDecision ? 3 : 2);
 }
 
-function discussionRoleOrderForDomain(domain: HallDiscussionDomain): HallSemanticRole[] {
-  if (domain === "engineering") return ["planner", "coder", "reviewer", "manager"];
-  if (domain === "creative") return ["planner", "coder", "manager"];
-  if (domain === "analysis") return ["planner", "coder", "manager"];
-  if (domain === "product") return ["planner", "reviewer", "manager"];
-  if (domain === "research") return ["planner", "reviewer", "manager"];
-  if (domain === "operations") return ["planner", "reviewer", "manager"];
-  return ["planner", "manager"];
+function discussionRoleOrder(): HallSemanticRole[] {
+  return ["planner", "coder", "reviewer", "generalist", "manager"];
 }
 
 function recommendedExecutorRoleOrder(domain: HallDiscussionDomain): HallSemanticRole[] {

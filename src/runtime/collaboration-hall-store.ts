@@ -49,6 +49,7 @@ const HALL_MESSAGE_KINDS: HallMessageKind[] = [
   "system",
 ];
 const HALL_TASK_STAGES: HallTaskStage[] = ["discussion", "execution", "review", "blocked", "completed"];
+const HALL_MESSAGE_CONTENT_MAX_CHARS = Number.POSITIVE_INFINITY;
 
 export class CollaborationHallStoreValidationError extends Error {
   readonly issues: string[];
@@ -806,7 +807,7 @@ function validateAppendHallMessageInput(input: AppendHallMessageInput): AppendHa
   const kind = input.kind === undefined ? undefined : optionalHallMessageKind(input.kind, "kind", issues);
   const authorParticipantId = requiredString(input.authorParticipantId, "authorParticipantId", 160, issues);
   const authorLabel = requiredString(input.authorLabel, "authorLabel", 120, issues);
-  const content = requiredString(input.content, "content", 4000, issues);
+  const content = requiredString(input.content, "content", HALL_MESSAGE_CONTENT_MAX_CHARS, issues);
   const targetParticipantIds =
     input.targetParticipantIds === undefined
       ? undefined

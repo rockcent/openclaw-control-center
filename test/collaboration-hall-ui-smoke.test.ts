@@ -69,6 +69,15 @@ test("collaboration hall renders a three-pane hall-first shell", () => {
   assert(script.includes("compositionend"));
   assert(script.includes("if (!pendingComposerSubmitAfterComposition) return;"));
   assert(script.includes("sanitizeDraftVisibleText"));
+  assert(script.includes("const visibleTypingDrafts = () => visibleDrafts().filter((draft) => !draft.settledAt);"));
+  assert(script.includes("const syntheticExecutionHandoffDraft = (taskCard, persistedThreadMessages) => {"));
+  assert(script.includes("if (!taskCard || taskCard.stage !== 'execution' || !taskCard.currentOwnerParticipantId) return [];"));
+  assert(script.includes("const latestHandoff = [...persistedThreadMessages].reverse().find((message) => {"));
+  assert(script.includes("targetIds.includes(ownerParticipantId)"));
+  assert(script.includes("draftId: 'synthetic-execution:' + taskCard.taskCardId + ':' + ownerParticipantId"));
+  assert(script.includes("if (event.type === 'draft_complete' && draft) {"));
+  assert(script.includes("draft.settledAt = event.createdAt || new Date().toISOString();"));
+  assert(script.includes("draft.persistedMessageId = event.messageId || '';"));
   assert(script.includes("contextToggles.forEach"));
   assert(script.includes("event.key === 'Escape'"));
 });
@@ -989,6 +998,66 @@ test("agent execution updates and handoffs stay visible even when they carry run
   assert(html.includes("第一版结果已经能成立，owner 和 next action 已经能看懂。"));
   assert(html.includes("@pandas"));
   assert(!html.includes("现在请老板评审。"));
+});
+
+test("same-author handoff keeps the polished visible version and hides the later flattened status duplicate", () => {
+  const html = renderCollaborationHall({
+    language: "zh",
+    hall: {
+      hallId: "main",
+      title: "Collaboration Hall",
+      participants: [],
+      taskCardIds: ["card-1"],
+      messageIds: ["msg-1", "msg-2"],
+      lastMessageId: "msg-2",
+      latestMessageAt: "2026-03-28T21:25:54.346Z",
+      createdAt: "2026-03-28T21:25:30.000Z",
+      updatedAt: "2026-03-28T21:25:54.346Z",
+    },
+    hallSummary: {
+      hallId: "main",
+      headline: "Keep the polished handoff visible and hide the flattened duplicate.",
+      activeTaskCount: 1,
+      waitingReviewCount: 0,
+      blockedTaskCount: 0,
+      updatedAt: "2026-03-28T21:25:54.346Z",
+    },
+    taskCards: [],
+    messages: [
+      {
+        hallId: "main",
+        messageId: "msg-1",
+        taskCardId: "card-1",
+        kind: "handoff",
+        authorParticipantId: "coq",
+        authorLabel: "Coq-每日新闻",
+        authorSemanticRole: "planner",
+        content: "三个开头文案先直接落这版：<br>任务被接住了：很多群聊的问题，不是没人说话，是说完以后还得你自己收尾。<br>中间协调被吃掉了：最烦的不是任务难，是你得一直自己转述上下文、分派、催下一步。<br>群聊变成闭环：讨论不会停在“大家觉得可以”，而是会收敛成 owner 和 next action。<br>@otter 你接着给这 3 个对应的 thumbnail。",
+        targetParticipantIds: [],
+        mentionTargets: [],
+        payload: { status: "runtime_handoff_update" },
+        createdAt: "2026-03-28T21:25:44.346Z",
+      },
+      {
+        hallId: "main",
+        messageId: "msg-2",
+        taskCardId: "card-1",
+        kind: "status",
+        authorParticipantId: "coq",
+        authorLabel: "Coq-每日新闻",
+        authorSemanticRole: "planner",
+        content: "三个开头文案先直接落这版： 任务被接住了：很多群聊的问题，不是没人说话，是说完以后还得你自己收尾。 中间协调被吃掉了：最烦的不是任务难，是你得一直自己转述上下文、分派、催下一步。 群聊变成闭环：讨论不会停在“大家觉得可以”，而是会收敛成 owner 和 next action。 @otter 你接着给这 3 个对应的 thumbnail。",
+        targetParticipantIds: [],
+        mentionTargets: [],
+        payload: { status: "runtime_execution_update" },
+        createdAt: "2026-03-28T21:25:54.346Z",
+      },
+    ],
+  });
+
+  assert.equal(html.match(/三个开头文案先直接落这版/g)?.length ?? 0, 1);
+  assert(html.includes("交接"));
+  assert(!html.includes(">状态<"));
 });
 
 test("legacy system progress copy stays hidden even when old messages are already persisted without payload status", () => {

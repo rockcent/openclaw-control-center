@@ -370,6 +370,121 @@ test("handoff outside the planned execution order keeps the queue and emits a wa
   }
 });
 
+test("runtime handoff still auto-dispatches when the current step handoff target and planned queue drift apart", async () => {
+  const backups = await backupFiles([
+    COLLABORATION_HALLS_PATH,
+    COLLABORATION_HALL_MESSAGES_PATH,
+    COLLABORATION_TASK_CARDS_PATH,
+    COLLABORATION_HALL_SUMMARIES_PATH,
+    PROJECTS_PATH,
+    TASKS_PATH,
+    CHAT_ROOMS_PATH,
+    CHAT_MESSAGES_PATH,
+  ]);
+
+  try {
+    const client = new FakeRuntimeToolClient();
+    const created = await createHallTaskFromOperatorRequest(
+      {
+        content: "Keep the runtime chain moving when the current step already points to the real next owner.",
+      },
+      {
+        toolClient: client,
+        skipDiscussion: true,
+      },
+    );
+    assert(created.taskCard);
+
+    await setHallTaskExecutionOrder({
+      taskCardId: created.taskCard.taskCardId,
+      executionItems: [
+        {
+          itemId: "item-pandas",
+          participantId: "pandas",
+          task: "Summarize the hall feature and hand the concrete thumbnail task to monkey.",
+          handoffToParticipantId: "monkey",
+          handoffWhen: "When the summary is clear enough for thumbnail work.",
+        },
+        {
+          itemId: "item-monkey",
+          participantId: "monkey",
+          task: "Build 3 thumbnail URLs from the summary.",
+          handoffToParticipantId: "main",
+          handoffWhen: "When the three URLs are ready for review.",
+        },
+        {
+          itemId: "item-main",
+          participantId: "main",
+          task: "Review the URLs and decide the next step.",
+        },
+      ],
+    });
+
+    const assigned = await assignHallTaskExecution({
+      taskCardId: created.taskCard.taskCardId,
+      ownerParticipantId: "pandas",
+    });
+    assert.equal(assigned.taskCard?.currentOwnerParticipantId, "pandas");
+
+    await updateHallTaskCard({
+      taskCardId: created.taskCard.taskCardId,
+      plannedExecutionOrder: ["main"],
+      plannedExecutionItems: [
+        {
+          itemId: "item-monkey",
+          participantId: "monkey",
+          task: "Build 3 thumbnail URLs from the summary.",
+          handoffToParticipantId: "main",
+          handoffWhen: "When the three URLs are ready for review.",
+        },
+        {
+          itemId: "item-main",
+          participantId: "main",
+          task: "Review the URLs and decide the next step.",
+        },
+      ],
+    });
+
+    client.queueResponse({
+      ok: true,
+      status: "ok",
+      text: `3 个 thumbnail URL 已经给到：1. https://example.com/thumb-1 2. https://example.com/thumb-2 3. https://example.com/thumb-3<hall-structured>${JSON.stringify({
+        latestSummary: "3 个 thumbnail URL 已经准备好，等 main 继续收口。",
+        nextAction: "continue",
+      })}</hall-structured>`,
+      rawText: "ok",
+      sessionKey: "agent:monkey:main",
+      sessionId: "monkey-runtime-session",
+    });
+
+    const handedOff = await recordHallTaskHandoff({
+      taskCardId: created.taskCard.taskCardId,
+      fromParticipantId: "pandas",
+      toParticipantId: "monkey",
+      handoff: {
+        goal: "Pass the concrete thumbnail step to monkey.",
+        currentResult: "The hall feature summary is ready for concrete thumbnail work.",
+        doneWhen: "Three thumbnail URLs are ready for review.",
+        blockers: [],
+        nextOwner: "monkey",
+        requiresInputFrom: [],
+      },
+    }, {
+      toolClient: client,
+    });
+
+    assert.equal(handedOff.taskCard?.currentOwnerParticipantId, "monkey");
+    assert.equal(handedOff.taskCard?.stage, "execution");
+    assert.equal(
+      handedOff.generatedMessages.some((message) => /planned next owner/i.test(message.content)),
+      false,
+    );
+    assert(handedOff.generatedMessages.some((message) => message.authorParticipantId === "monkey"));
+  } finally {
+    await restoreFiles(backups);
+  }
+});
+
 test("hall greeting without a selected task still gets a lobby reply", async () => {
   const backups = await backupFiles([
     COLLABORATION_HALLS_PATH,
@@ -533,7 +648,8 @@ test("non-coding first hall message triggers multi-agent discussion instead of a
     assert(!uniqueAuthors.includes("otter"));
     assert(!uniqueAuthors.includes("tiger"));
     const detail = await readCollaborationHallTaskDetail(result.taskCard!.taskCardId);
-    assert.match(detail.taskCard.proposal ?? "", /受众|叙事|brief|样片|可评审/i);
+    assert.match(detail.taskCard.proposal ?? "", /目标|受众|第一版|具体例子|一眼看懂/i);
+    assert.doesNotMatch(detail.taskCard.proposal ?? "", /brief|样片|分镜|storyboard|motion sample/i);
 
     assert.equal(hall.taskCards.length, 1);
     assert(hall.messages.some((message) => message.taskCardId === result.taskCard?.taskCardId));
@@ -542,7 +658,7 @@ test("non-coding first hall message triggers multi-agent discussion instead of a
   }
 });
 
-test("research-style hall message picks a minimal role-matched discussion group", async () => {
+test("research-style hall message uses the same generic discussion path instead of a domain-specialized group", async () => {
   const backups = await backupFiles([
     COLLABORATION_HALLS_PATH,
     COLLABORATION_HALL_MESSAGES_PATH,
@@ -574,12 +690,52 @@ test("research-style hall message picks a minimal role-matched discussion group"
     const uniqueAuthors = [...new Set(detail.messages.map((message) => message.authorParticipantId).filter((participantId) => participantId !== "operator"))];
     assert.equal(uniqueAuthors.length, 2);
     assert.ok(uniqueAuthors.includes("coq"));
-    assert.ok(uniqueAuthors.includes("otter"));
+    assert.ok(uniqueAuthors.includes("monkey"));
     assert.deepEqual(detail.taskCard.plannedExecutionOrder, []);
     assert.equal(detail.taskCard.currentOwnerParticipantId, undefined);
     assert.equal(detail.taskCard.decision, undefined);
     assert.equal(detail.taskCard.plannedExecutionItems.length, 0);
-    assert.match(detail.taskCard.proposal ?? "", /研究问题|证据|结论|调查视角/i);
+    assert.match(detail.taskCard.proposal ?? "", /目标|第一版|具体例子|一眼看懂/i);
+    assert.doesNotMatch(detail.taskCard.proposal ?? "", /brief|样片|分镜|storyboard|motion sample/i);
+  } finally {
+    await restoreFiles(backups);
+  }
+});
+
+test("broad video intro ask no longer defaults the first discussion reply into creative-production jargon", async () => {
+  const backups = await backupFiles([
+    COLLABORATION_HALLS_PATH,
+    COLLABORATION_HALL_MESSAGES_PATH,
+    COLLABORATION_TASK_CARDS_PATH,
+    COLLABORATION_HALL_SUMMARIES_PATH,
+    PROJECTS_PATH,
+    TASKS_PATH,
+    CHAT_ROOMS_PATH,
+    CHAT_MESSAGES_PATH,
+  ]);
+
+  try {
+    await resetFiles([
+      COLLABORATION_HALLS_PATH,
+      COLLABORATION_HALL_MESSAGES_PATH,
+      COLLABORATION_TASK_CARDS_PATH,
+      COLLABORATION_HALL_SUMMARIES_PATH,
+      PROJECTS_PATH,
+      TASKS_PATH,
+      CHAT_ROOMS_PATH,
+      CHAT_MESSAGES_PATH,
+    ]);
+    const result = await postHallMessage({
+      content: "我想要做一个视频 介绍我的群聊功能",
+    });
+
+    await waitForHallBackgroundWork();
+    const detail = await readCollaborationHallTaskDetail(result.taskCard!.taskCardId);
+    const firstAgentReply = detail.messages.find((message) => message.authorParticipantId !== "operator");
+
+    assert(firstAgentReply);
+    assert.doesNotMatch(firstAgentReply.content, /第三拍|停得更久|brief|分镜|storyboard|样片|motion sample/i);
+    assert.match(firstAgentReply.content, /一眼看懂|第一版|目标|例子/i);
   } finally {
     await restoreFiles(backups);
   }
@@ -719,7 +875,7 @@ test("explicit follow-up asking for a decision brings in manager directly after 
     assert(decisionMessage);
     const newAuthorsAfterPrompt = [...new Set(taskMessages.slice(beforeCount).map((message) => message.authorParticipantId).filter((participantId) => participantId !== "operator"))];
     assert.deepEqual(newAuthorsAfterPrompt, ["main"]);
-    assert.match(decisionMessage.content, /先让|第一版具体产物|first pass|take the first pass/i);
+    assert.match(decisionMessage.content, /明确目标|最小可评审结果|第一棒|first pass|prove direction/i);
   } finally {
     await restoreFiles(backups);
   }
@@ -1708,7 +1864,7 @@ test("runtime execution stays inside the current action item and automatically h
         {
           itemId: "item-monkey",
           participantId: "monkey",
-          task: "Expand the chosen hook into the next script beat.",
+          task: "Expand the chosen hook into exactly three thumbnail directions.",
         },
       ],
     });
@@ -1772,7 +1928,7 @@ test("runtime execution stays inside the current action item and automatically h
     assert.match(client.agentRunStreamCalls[0]?.message ?? "", /Hall roster for this round:/i);
     assert.match(client.agentRunStreamCalls[0]?.message ?? "", /pandas \(you\) — role: .*persona: .*this round: current owner on "Scan the codebase and summarize what the new hall chat feature already does\."/i);
     assert.match(client.agentRunStreamCalls[0]?.message ?? "", /Coq-每日新闻 — role: .*persona: .*this round: "Turn the code summary into exactly three strong hook options for the video\.", then hand to monkey/i);
-    assert.match(client.agentRunStreamCalls[0]?.message ?? "", /monkey — role: .*persona: .*this round: "Expand the chosen hook into the next script beat\."/i);
+    assert.match(client.agentRunStreamCalls[0]?.message ?? "", /monkey — role: .*persona: .*this round: "Expand the chosen hook into exactly three thumbnail directions\."/i);
     assert.equal(client.agentRunStreamCalls[0]?.context?.surface, "control-center/hall");
     assert.equal(client.agentRunStreamCalls[0]?.context?.workspaceRoot, process.cwd());
     assert.equal(client.agentRunStreamCalls[0]?.context?.workdir, process.cwd());
@@ -1784,7 +1940,7 @@ test("runtime execution stays inside the current action item and automatically h
     assert.match(client.agentRunStreamCalls[1]?.message ?? "", /Hall roster for this round:/i);
     assert.match(client.agentRunStreamCalls[1]?.message ?? "", /Coq-每日新闻 \(you\).*persona:/i);
     assert.match(client.agentRunStreamCalls[1]?.message ?? "", /monkey — role: .*persona:/i);
-    assert.match(client.agentRunStreamCalls[2]?.message ?? "", /Handoff goal: Expand the chosen hook into the next script beat/i);
+    assert.match(client.agentRunStreamCalls[2]?.message ?? "", /Handoff goal: Expand the chosen hook into exactly three thumbnail directions/i);
   } finally {
     await restoreFiles(backups);
   }
@@ -2589,9 +2745,9 @@ test("runtime-backed hall discussion defaults to two distinct agent replies when
     assert.notEqual(distinctAuthors[0], distinctAuthors[1]);
     const runtimeCalls = client.agentRunStreamCalls.length > 0 ? client.agentRunStreamCalls : client.agentRunCalls;
     assert.equal(runtimeCalls.length >= 2, true);
-    assert.match(runtimeCalls[1]!.message, /Another teammate already spoke in this round/i);
-    assert.match(runtimeCalls[1]!.message, /The teammate you are building on is/i);
-    assert.match(runtimeCalls[1]!.message, /先把成功标准锁成一句能复述的话|owner 和 next action|先亮 owner 和 next action/i);
+    assert.match(runtimeCalls[1]!.message, /Recent shared thread transcript \(oldest -> newest\):/i);
+    assert.match(runtimeCalls[1]!.message, /Coq-每日新闻 \[planner\]: 先把成功标准锁成一句能复述的话。/i);
+    assert.match(runtimeCalls[1]!.message, /Answer the latest human message directly\./i);
   } finally {
     await restoreFiles(backups);
   }
@@ -2644,7 +2800,8 @@ test("runtime-backed non-manager discussion replies do not visibly @route the ne
     assert.match(monkeyReply.content, /\bpandas\b/i);
 
     const runtimeCalls = client.agentRunStreamCalls.length > 0 ? client.agentRunStreamCalls : client.agentRunCalls;
-    assert.match(runtimeCalls[1]!.message, /Do not nominate, @mention, or route the next executor yet/i);
+    assert.match(runtimeCalls[1]!.message, /This is discussion only\. Do not start execution yet\./i);
+    assert.match(runtimeCalls[1]!.message, /If you mention a teammate by name, use a real hall participant name\./i);
   } finally {
     await restoreFiles(backups);
   }

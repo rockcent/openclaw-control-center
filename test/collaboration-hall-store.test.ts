@@ -72,6 +72,69 @@ test("collaboration hall store persists the default hall, task cards, and messag
   }
 });
 
+test("collaboration hall store accepts long hall replies without rejecting them as invalid payloads", async () => {
+  const hallsBefore = await readOptionalFile(COLLABORATION_HALLS_PATH);
+  const messagesBefore = await readOptionalFile(COLLABORATION_HALL_MESSAGES_PATH);
+  const taskCardsBefore = await readOptionalFile(COLLABORATION_TASK_CARDS_PATH);
+
+  try {
+    const hall = await ensureDefaultCollaborationHall([
+      {
+        participantId: "coq",
+        agentId: "coq",
+        displayName: "Coq-每日新闻",
+        semanticRole: "planner",
+        active: true,
+        aliases: ["Coq-每日新闻", "coq"],
+      },
+    ]);
+    const taskCard = await createHallTaskCard({
+      hallId: hall.hallId,
+      projectId: "collaboration-hall",
+      taskId: "long-message-test",
+      roomId: "collaboration-hall:long-message-test",
+      title: "Long message test",
+      description: "Persist a long hall reply.",
+      createdByParticipantId: "operator",
+    });
+    const longReply = [
+      "三个版本我都重写了一轮，先把第一版里字太多的问题压下去。",
+      "开头 1：任务被接住了，不用再靠你自己在群里来回催。",
+      "开头 2：中间协调被系统吃掉了，你只做最后确认。",
+      "开头 3：群聊不是停在共识，而是继续往下执行。",
+      "补充说明：".repeat(900),
+    ].join("\n\n");
+
+    const appended = await appendHallMessage({
+      hallId: hall.hallId,
+      taskCardId: taskCard.taskCard.taskCardId,
+      projectId: "collaboration-hall",
+      taskId: "long-message-test",
+      roomId: "collaboration-hall:long-message-test",
+      authorParticipantId: "coq",
+      authorLabel: "Coq-每日新闻",
+      kind: "proposal",
+      content: longReply,
+    });
+
+    assert.equal(appended.message.content, longReply);
+    assert(appended.message.content.length > 4_000);
+
+    const messageStore = await loadCollaborationHallMessageStore();
+    assert(
+      messageStore.messages.some((item) =>
+        item.taskId === "long-message-test"
+        && item.authorParticipantId === "coq"
+        && item.content === longReply,
+      ),
+    );
+  } finally {
+    await restoreOptionalFile(COLLABORATION_HALLS_PATH, hallsBefore);
+    await restoreOptionalFile(COLLABORATION_HALL_MESSAGES_PATH, messagesBefore);
+    await restoreOptionalFile(COLLABORATION_TASK_CARDS_PATH, taskCardsBefore);
+  }
+});
+
 async function readOptionalFile(path: string): Promise<string | undefined> {
   try {
     return await readFile(path, "utf8");

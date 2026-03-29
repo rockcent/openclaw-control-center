@@ -13,6 +13,7 @@ import {
 import type { AgentRunRequest, AgentRunTransportContext } from "../contracts/openclaw-tools";
 import type {
   CollaborationHall,
+  HallExecutionItem,
   HallMessage,
   HallParticipant,
   HallSemanticRole,
@@ -100,6 +101,8 @@ interface ConcreteDeliverableEnforcement {
   nextAction?: HallRuntimeNextAction;
   suppressVisibleMessage?: boolean;
   nextStep?: string;
+  messageKindOverride?: HallMessage["kind"];
+  preserveExistingSummary?: boolean;
 }
 
 type HallOperatorIntentType =
@@ -178,12 +181,6 @@ export async function dispatchHallRuntimeTurn(input: HallRuntimeDispatchInput): 
   }
 
   const expectedSessionKey = pickExpectedSessionKey(input.taskCard, participantAgentId);
-  const baselineHistory = expectedSessionKey
-    ? await safeReadHistory(input.client, expectedSessionKey)
-    : [];
-  const baselineFingerprint = baselineHistory.at(-1) ? fingerprintHistoryMessage(baselineHistory.at(-1)!) : undefined;
-  const repoContext = buildHallRuntimeRepoContext(input);
-  const prompt = buildHallRuntimePrompt(input, repoContext);
   const draftId = beginHallDraftReply({
     hallId: input.hall.hallId,
     taskCardId: input.taskCard.taskCardId,
@@ -198,6 +195,7 @@ export async function dispatchHallRuntimeTurn(input: HallRuntimeDispatchInput): 
   });
 
   let currentSessionKey = expectedSessionKey;
+  let baselineFingerprint: string | undefined;
   let lastStreamedText = "";
   let lastHistoryDraftText = "";
   let sessionHistoryObserved = false;
@@ -205,7 +203,7 @@ export async function dispatchHallRuntimeTurn(input: HallRuntimeDispatchInput): 
   let finished = false;
 
   const applyDraftText = (nextDraftText: string, source: "session" | "stdout"): void => {
-    const normalized = nextDraftText.trim();
+    const normalized = formatHallRuntimeDraftVisibleText(input, nextDraftText).trim();
     if (!normalized) return;
     if (normalized.length <= lastStreamedText.length) return;
     if (lastStreamedText && !normalized.startsWith(lastStreamedText)) {
@@ -233,28 +231,33 @@ export async function dispatchHallRuntimeTurn(input: HallRuntimeDispatchInput): 
     });
   };
 
-  const flushHistory = async (sessionKey: string | undefined): Promise<void> => {
-    if (!sessionKey) return;
-    const history = await safeReadHistory(input.client, sessionKey);
-    const nextDraftText = renderRuntimeDraftText(history, baselineFingerprint);
-    if (!nextDraftText) return;
-    lastHistoryDraftText = nextDraftText;
-    sessionHistoryObserved = true;
-    applyDraftText(nextDraftText, "session");
-  };
-
-  const poller = (async () => {
-    while (!finished) {
-      try {
-        await flushHistory(currentSessionKey);
-      } catch {
-        // Best-effort only; final completion still comes from agentRun().
-      }
-      await delay(HALL_RUNTIME_POLL_INTERVAL_MS);
-    }
-  })();
-
+  let poller: Promise<void> | undefined;
   try {
+    const baselineHistory = expectedSessionKey
+      ? await safeReadHistory(input.client, expectedSessionKey)
+      : [];
+    baselineFingerprint = baselineHistory.at(-1) ? fingerprintHistoryMessage(baselineHistory.at(-1)!) : undefined;
+    const repoContext = buildHallRuntimeRepoContext(input);
+    const prompt = buildHallRuntimePrompt(input, repoContext);
+    const flushHistory = async (sessionKey: string | undefined): Promise<void> => {
+      if (!sessionKey) return;
+      const history = await safeReadHistory(input.client, sessionKey);
+      const nextDraftText = renderRuntimeDraftText(history, baselineFingerprint);
+      if (!nextDraftText) return;
+      lastHistoryDraftText = nextDraftText;
+      sessionHistoryObserved = true;
+      applyDraftText(nextDraftText, "session");
+    };
+    poller = (async () => {
+      while (!finished) {
+        try {
+          await flushHistory(currentSessionKey);
+        } catch {
+          // Best-effort only; final completion still comes from agentRun().
+        }
+        await delay(HALL_RUNTIME_POLL_INTERVAL_MS);
+      }
+    })();
     const request: AgentRunRequest = {
       agentId: participantAgentId,
       sessionKey: expectedSessionKey,
@@ -268,7 +271,7 @@ export async function dispatchHallRuntimeTurn(input: HallRuntimeDispatchInput): 
           onStdoutChunk: (chunk) => {
             directStdoutBuffer += chunk;
             if (sessionHistoryObserved) return;
-            const directText = sanitizeDirectRuntimeOutput(directStdoutBuffer);
+            const directText = formatHallRuntimeDraftVisibleText(input, directStdoutBuffer);
             if (!directText) return;
             applyDraftText(directText, "stdout");
           },
@@ -280,8 +283,7 @@ export async function dispatchHallRuntimeTurn(input: HallRuntimeDispatchInput): 
     await flushHistory(currentSessionKey);
     const parsed = extractStructuredBlock(response.text);
     const visibleContent = sanitizeHallVisibleRuntimeText(lastHistoryDraftText)
-      || sanitizeHallVisibleRuntimeText(parsed.visibleText)
-      || buildFallbackVisibleContent(input, response.text);
+      || sanitizeHallVisibleRuntimeText(parsed.visibleText);
     const structured = parsed.structured;
     const result = buildHallRuntimeResult({
       input,
@@ -339,7 +341,7 @@ export async function dispatchHallRuntimeTurn(input: HallRuntimeDispatchInput): 
     throw error;
   } finally {
     finished = true;
-    await poller.catch(() => undefined);
+    await poller?.catch(() => undefined);
   }
 }
 
@@ -361,7 +363,6 @@ function buildHallRuntimePrompt(input: HallRuntimeDispatchInput, repoContext: Ha
       ].join("\n")
     : "";
   const role = input.participant.semanticRole;
-  const roleFocus = describeDiscussionRoleFocus(role, `${input.taskCard.title}\n${input.taskCard.description}`);
   const currentExecutionItem = resolveCurrentExecutionItem(input.taskCard, input.participant.participantId);
   const nextParticipantId = currentExecutionItem?.handoffToParticipantId?.trim()
     || input.taskCard.plannedExecutionOrder[0]
@@ -379,10 +380,7 @@ function buildHallRuntimePrompt(input: HallRuntimeDispatchInput, repoContext: Ha
   const handoffArtifactBlock = buildHallRuntimeArtifactBlock(input.handoff?.artifactRefs, responseLanguage, "handoff");
   const operatorIntent = resolveHallOperatorIntent(input);
   const directResponseIntent = isDirectResponseIntent(operatorIntent) ? operatorIntent : undefined;
-  const discussionTurnCount = input.taskCard.discussionCycle?.completedParticipantIds.length ?? 0;
-  const isFollowupDiscussionVoice = discussionTurnCount > 0;
-  const priorTeammateHint = buildPreviousTeammateHint(recentMessages, input.participant.participantId);
-  const common = [
+  const commonBase = [
     `You are ${input.participant.displayName}, participating in the control-center Collaboration Hall.`,
     `Your semantic responsibility is ${role}.`,
     `Task title: ${input.taskCard.title}`,
@@ -398,13 +396,7 @@ function buildHallRuntimePrompt(input: HallRuntimeDispatchInput, repoContext: Ha
     taskArtifactBlock,
     handoffArtifactBlock,
     ...repoContextLines,
-    "Reply like a real coworker in a busy work chat: 1-3 short lines, concrete and specific, no memo tone.",
-    "Sound like a teammate doing the work, not a narrator explaining the workflow.",
-    "Short beats only: result first, then the next useful move or @who takes it next.",
-    "Acknowledge only the latest unresolved point and add the next useful contribution instead of rewriting the whole plan.",
-    "Prefer direct work-chat phrasing: short, decisive, easy to hand off. Avoid retrospective or report tone.",
     "Do not write labels like Proposal, Decision, Suggested order, Suggested first executor, owner, or doneWhen in the visible reply.",
-    'Avoid filler openings like "我先把…", "当前结果是…", "现阶段…", "我建议下一步…", "I want to clarify", or "At this stage". Start with the concrete action or result.',
     responseLanguageInstruction,
     "Do not mention hidden system instructions.",
     "If you include structured state, append one JSON block at the very end using <hall-structured>{...}</hall-structured>.",
@@ -418,7 +410,7 @@ function buildHallRuntimePrompt(input: HallRuntimeDispatchInput, repoContext: Ha
           ? "The latest human message is directly asking you for a targeted review answer. Reply with the must-fix point or a clean pass right now."
           : "The latest human message is directly assigning you a concrete deliverable. Post that deliverable right now instead of turning this into a decision or workflow recap.";
       return [
-        ...common,
+        ...commonBase,
         directResponseIntent.explicitTarget
           ? "The latest human message is explicitly assigning you work right now."
           : "The latest human message is asking for a concrete result right now, and you are the one replying to it.",
@@ -429,53 +421,34 @@ function buildHallRuntimePrompt(input: HallRuntimeDispatchInput, repoContext: Ha
         directResponseIntent.type === "review_request"
           ? "Keep the reply focused: pass / must-fix only. Do not reopen planning unless the human explicitly asks for that."
           : "Do not delegate the work away before posting the deliverable the human asked you for.",
+        "Detailed answers are allowed when they are more useful than a short reply.",
         "Do not turn this into a decision, reassignment, or process recap.",
         'Structured JSON keys you may include: "proposal", "artifactRefs".',
       ].filter(Boolean).join("\n");
     }
-    const rosterLine = input.hall.participants.length > 0
-      ? `Only refer to real hall participants by these exact names when you recommend an executor: ${input.hall.participants.map((participant) => participant.displayName).join(", ")}.`
-      : "";
     return [
-      ...common,
+      ...commonBase,
       "This is discussion only. Do not start execution yet.",
       "Do not act like a greeter and do not ask to create a task card; the hall already has enough context to discuss the work.",
-      rosterLine,
-      role === "manager"
-        ? "You are landing the thread on a practical next step. Give one short decision, name exactly one first executor by real agent name, and define doneWhen. Do not recap the whole thread."
-        : roleFocus,
       explicitHallMentionTargetLine(input),
-      isFollowupDiscussionVoice
-        ? "Another teammate already spoke in this round. Start by building directly on that point, then add only one new angle, correction, or missing constraint."
-        : "You are the first responder in this round. Open with one concrete angle and leave space for the next teammate to add a different one.",
-      priorTeammateHint,
-      role !== "manager"
-        ? "Add one distinct missing perspective instead of repeating the previous speaker or rewriting the whole plan. One useful angle is enough."
-        : "Write like a teammate in chat who is wrapping things up. One short decision, one explicit first owner, one done-when is enough.",
-      role !== "manager"
-        ? "Do not nominate, @mention, or route the next executor yet. Leave explicit owner-picking and handoff language to the manager unless the human explicitly asked about a named teammate."
-        : "",
-      role !== "manager"
-        ? "Assume at least one teammate will speak after you unless the human explicitly @mentions only one person. Do not try to answer everything yourself."
-        : "",
-      role !== "manager"
-        ? "If you are not the manager, do not assign work with an @mention unless the human explicitly asked for that teammate."
-        : "",
-      isFollowupDiscussionVoice
-        ? "Do not restart the thread from scratch. No long recap. Make the previous speaker's point stronger or sharper in one move, and do not reuse their opening sentence or summary."
-        : "Do not dump a full plan. Your job is to open one good angle, not to say everything at once.",
-      isFollowupDiscussionVoice
-        ? "React to the teammate's point directly, then add one missing delta. Avoid canned openers or speech-style framing."
-        : "Start with the concrete point itself. Avoid canned openers, scene-setting, or speech-style framing.",
-      "Do not explain the whole product or workflow unless that exact explanation is the missing angle.",
-      "One useful push is enough: a sharper criterion, a must-fix risk, or a clearer next move.",
+      "Answer the latest human message directly.",
+      "Use any helpful context from the thread, but you do not need to follow a fixed discussion shape.",
+      "You may agree, disagree, refine, redirect, or propose a better angle if that is more useful.",
+      "Detailed answers are allowed. If a full version, rewrite, expansion, or example would help, give it in full.",
+      "If you mention a teammate by name, use a real hall participant name.",
       'Structured JSON keys you may include: "proposal", "decision", "executor", "doneWhen", "artifactRefs".',
     ].join("\n");
   }
 
   if (input.mode === "handoff" && input.handoff) {
     return [
-      ...common,
+      ...commonBase,
+      "Reply like a real coworker in a busy work chat: concrete, specific, and natural, without memo tone.",
+      "Sound like a teammate helping the work move, not a narrator explaining the workflow.",
+      "Lead with the point itself, not with scene-setting or report language.",
+      "Only answer the part that still matters. Do not rewrite the whole thread.",
+      "Prefer direct work-chat phrasing: decisive, easy to hand off, and natural. Avoid retrospective or report tone.",
+      'Avoid filler openings like "我先把…", "当前结果是…", "现阶段…", "我建议下一步…", "I want to clarify", or "At this stage". Start with the concrete action or result.',
       "You are receiving a structured handoff and should continue the real work now.",
       `Handoff goal: ${input.handoff.goal}`,
       `Current result: ${input.handoff.currentResult}`,
@@ -491,7 +464,7 @@ function buildHallRuntimePrompt(input: HallRuntimeDispatchInput, repoContext: Ha
         ? `Your exact planned execution item is: ${nextExecutionItem.task}`
         : "",
       "Use your real tools if needed. Then reply like a coworker in chat, not like a memo.",
-      "Keep it brief unless the deliverable itself is a list, URLs, or concrete repo/file findings. In those cases, post the full deliverable instead of summarizing it away.",
+      "Post the full deliverable the step actually needs. Do not summarize or compress away real output.",
       "For repo/code-scan work, inspect the repo before replying and cite real file paths plus what each file proves.",
       buildConcreteExecutionOutputRequirement(nextExecutionItem?.task ?? input.handoff.goal, responseLanguage),
       "Prefer this shape: what changed, and @who acts next.",
@@ -509,8 +482,14 @@ function buildHallRuntimePrompt(input: HallRuntimeDispatchInput, repoContext: Ha
   }
 
   return [
-    ...common,
-    "You are the current execution owner. Do the real work now if needed, then post a concise worker update for the hall.",
+    ...commonBase,
+    "Reply like a real coworker in a busy work chat: concrete, specific, and natural, without memo tone.",
+    "Sound like a teammate helping the work move, not a narrator explaining the workflow.",
+    "Lead with the point itself, not with scene-setting or report language.",
+    "Only answer the part that still matters. Do not rewrite the whole thread.",
+    "Prefer direct work-chat phrasing: decisive, easy to hand off, and natural. Avoid retrospective or report tone.",
+    'Avoid filler openings like "我先把…", "当前结果是…", "现阶段…", "我建议下一步…", "I want to clarify", or "At this stage". Start with the concrete action or result.',
+    "You are the current execution owner. Do the real work now if needed, then post the full worker result needed by the hall.",
     currentExecutionItem?.task ? `Your current execution item: ${currentExecutionItem.task}` : "",
     currentExecutionItem?.handoffWhen ? `Your step is done when: ${currentExecutionItem.handoffWhen}` : "",
     nextParticipant
@@ -520,7 +499,7 @@ function buildHallRuntimePrompt(input: HallRuntimeDispatchInput, repoContext: Ha
     input.note ? `Assignment note: ${input.note}` : "",
     "Stay inside the current execution item only. Do not complete deliverables that belong to later owners in the execution order.",
     "Write like a coworker in a work chat.",
-    "Keep it brief unless the deliverable itself is a list, URLs, or concrete repo/file findings. In those cases, post the full deliverable instead of compressing it into two lines.",
+    "Post the full deliverable the step actually needs. Do not compress real output into two lines.",
     "Say only what concrete result now exists, any real blocker, and @who acts next.",
     "If your current execution item asks for a concrete deliverable, the visible reply must contain that deliverable itself: the actual hooks, thumbnail ideas, URLs, script lines, file findings, or repo evidence. Do not just comment on what should be done.",
     "For code-scan / repo-summary work, inspect the repo before replying. The visible reply must cite real file paths and what you found in them.",
@@ -578,8 +557,7 @@ function resolveHallOperatorIntent(
     input.mode === "discussion"
     && !explicitTarget
     && (
-      type === "direct_deliverable_request"
-      || type === "repo_scan_request"
+      type === "repo_scan_request"
       || type === "review_request"
     )
   ) {
@@ -594,22 +572,37 @@ function resolveHallOperatorIntent(
 }
 
 function classifyHallOperatorIntent(text: string): HallOperatorIntentType {
+  const normalized = normalizeHallIntentSourceText(text);
   if (/(开始执行|继续讨论|安排后续顺序|调整执行顺序|保存顺序|stop|停止|暂停|恢复|resume|start execution)/i.test(text)) {
     return "control_request";
   }
   if (/(收一下|收个口|给个结论|拍板|定一下|做决定|作决定|第一执行者|建议第一位执行者|先给.*第一步|给.*第一步|谁先做|谁来做第一步|谁来先做|执行顺序|下一步由谁|谁负责)/i.test(text)) {
     return "planning_request";
   }
-  if (/(repo|repository|codebase|source code|scan code|scan the repo|implementation|file path|workspace|代码|源码|仓库|扫描代码|扫代码|实现|文件)/i.test(text)) {
+  if (looksLikeRepoInspectionRequest(normalized)) {
     return "repo_scan_request";
   }
   if (/(must-fix|review|审核|评审|检查|挑一下|挑出|只挑|硬问题|硬缺口)/i.test(text)) {
     return "review_request";
   }
-  if (/(给我|给一下|直接给|你给|你来|你去|请你|帮我|直接出|出一下|写一下|写一版|给一版|直接贴|贴一下|去扫|扫一下|看一下|查一下|产出|生成|整理|总结|扫描|scan|inspect|check|review|write|draft|produce|generate|show me|give me|please give|please write|please scan|can you|could you|完整的?.*(开头|口播|脚本|文案|版本)|三个?.*(开头|视频开头|口播开头)|3 个.*(开头|视频开头|口播开头|hook|thumbnail))/i.test(text)) {
+  if (/(给我|给一下|直接给|你给|你来|你去|请你|帮我|直接出|出一下|写一下|写一版|给一版|直接贴|贴一下|去扫|扫一下|看一下|查一下|产出|生成|整理|总结|扫描|优化|改一下|改一版|改版|再优化|减字|加图|加一些图|润色|收紧|展开|展开一下|展开一点|详细展开|详细一点|具体一点|写完整|写长一点|完整版本|scan|inspect|check|review|write|draft|produce|generate|optimize|revise|polish|tighten|expand|elaborate|flesh out|make it fuller|show me|give me|please give|please write|please scan|can you|could you|完整的?.*(开头|口播|脚本|文案|版本)|三个?.*(开头|视频开头|口播开头)|3 个.*(开头|视频开头|口播开头|hook|thumbnail))/i.test(text)) {
     return "direct_deliverable_request";
   }
   return "discussion_request";
+}
+
+function normalizeHallIntentSourceText(text: string): string {
+  return String(text || "")
+    .replace(/file:\/\/\/\S+/gi, " ")
+    .replace(/\bhttps?:\/\/\S+\.(?:html?|png|jpe?g|gif|webp|svg)(?:[?#]\S*)?/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function looksLikeRepoInspectionRequest(text: string): boolean {
+  const normalized = normalizeHallIntentSourceText(text);
+  if (!normalized) return false;
+  return /(repo|repository|codebase|source code|scan code|scan the repo|implementation|file path|source file|entry file|看代码|看仓库|查仓库|扫描代码|扫代码|源码|仓库|实现|入口文件|文件路径|哪个文件|哪些文件)/i.test(normalized);
 }
 
 function isDirectResponseIntent(intent: HallOperatorIntent | undefined): intent is HallOperatorIntent {
@@ -719,7 +712,7 @@ function looksLikeRepoAwareTask(input: HallRuntimeDispatchInput): boolean {
     input.triggerMessage?.content ?? "",
     resolveCurrentExecutionItem(input.taskCard, input.participant.participantId)?.task ?? "",
   ].join("\n");
-  return /(repo|repository|codebase|source code|scan code|scan the repo|implementation|file path|workspace|代码|源码|仓库|扫描代码|扫代码|实现|文件)/i.test(source);
+  return looksLikeRepoInspectionRequest(source);
 }
 
 function resolveCurrentExecutionItem(
@@ -738,41 +731,6 @@ function resolvePlannedExecutionItem(
   const current = taskCard.currentExecutionItem;
   if (current?.participantId === participantId) return current;
   return taskCard.plannedExecutionItems.find((item) => item.participantId === participantId);
-}
-
-function describeDiscussionRoleFocus(role: HallParticipant["semanticRole"], source: string): string {
-  const normalized = source.toLowerCase();
-  const creative = /(动画|动效|可视化|visual|animation|storyboard|脚本|海报|品牌|创意|设计稿|style frame)/i.test(normalized);
-  const analysis = /(数据|图表|dashboard|指标|分析|insight|metric|analytics|可视化)/i.test(normalized);
-  const research = /(调研|research|benchmark|study|compare|调查|访谈|洞察|评估)/i.test(normalized);
-  const product = /(产品|发布|roadmap|增长|用户|功能|体验|launch|go[- ]to[- ]market|workflow|feature)/i.test(normalized);
-  const operations = /(运营|流程|排期|runbook|support|审批|交接|上线|通知|治理)/i.test(normalized);
-
-  if (role === "planner") {
-    if (creative) return "Focus on clarifying the brief: audience, message, style boundary, output format, and what the first reviewable creative artifact should be.";
-    if (analysis) return "Focus on clarifying the question, audience, data scope, output artifact, and what decision the result should support.";
-    if (research) return "Focus on clarifying the research question, evidence standard, and what kind of conclusion will be useful.";
-    if (product) return "Focus on clarifying the user problem, success criteria, constraints, and the smallest meaningful first slice.";
-    if (operations) return "Focus on clarifying the workflow, stakeholders, approvals, and handoff boundaries before execution starts.";
-    return "Focus on clarifying the outcome, audience, constraints, and what done should mean before execution starts.";
-  }
-  if (role === "coder") {
-    if (creative) return "Act as the practical implementer. Propose a concrete execution path such as storyboard -> sample -> iteration, even though this is not a coding-only task.";
-    if (analysis) return "Act as the practical implementer. Propose a concrete path to turn the idea into a reviewable prototype or artifact.";
-    if (research) return "Act as the practical implementer. Propose a concrete path to collect evidence, synthesize it, and return a usable recommendation.";
-    if (product) return "Act as the practical implementer. Propose the first tangible draft, prototype, or plan that can validate the direction.";
-    if (operations) return "Act as the practical implementer. Propose the first controlled workflow slice that can be executed and observed.";
-    return "Act as the practical implementer. Propose the first concrete deliverable that proves the direction without over-scoping.";
-  }
-  if (role === "reviewer") {
-    if (creative) return "Stress-test the brief, scope, approval checkpoints, and the risk of making something polished before the direction is validated.";
-    if (analysis) return "Stress-test the data quality, narrative honesty, audience fit, and whether the proposed artifact can actually answer the question.";
-    if (research) return "Stress-test the evidence plan, scope, and whether the output will lead to a usable conclusion.";
-    if (product) return "Stress-test the assumptions, dependencies, and whether the first slice is small enough to evaluate cleanly.";
-    if (operations) return "Stress-test the workflow, blocker points, and where ownership or approval might break down.";
-    return "Stress-test the assumptions, scope, reviewability, and hidden risks in the proposed first pass.";
-  }
-  return "Be available for targeted input if another participant explicitly needs your perspective.";
 }
 
 function buildHallRuntimeRosterBlock(input: HallRuntimeDispatchInput): string {
@@ -935,25 +893,6 @@ function explicitHallMentionTargetLine(input: HallRuntimeDispatchInput): string 
   return `The latest human message explicitly @mentioned: ${targets.join(", ")}. Respect that routing instead of broadening the room unless the human asks for more voices.`;
 }
 
-function buildPreviousTeammateHint(messages: HallMessage[], currentParticipantId: string): string {
-  const previousTeammate = [...messages]
-    .reverse()
-    .find((message) =>
-      message.authorParticipantId &&
-      message.authorParticipantId !== "operator" &&
-      message.authorParticipantId !== currentParticipantId &&
-      message.kind !== "system",
-    );
-  if (!previousTeammate) return "";
-  const compact = sanitizeHallVisibleRuntimeText(previousTeammate.content)
-    .replace(/<br\s*\/?>/gi, " / ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!compact) return "";
-  const clipped = compact.length > 220 ? `${compact.slice(0, 217).trim()}...` : compact;
-  return `The teammate you are building on is ${previousTeammate.authorLabel}. Their latest point was: "${clipped}". Add only the missing delta instead of paraphrasing them.`;
-}
-
 function dedupeHallPromptMessages(messages: HallMessage[]): HallMessage[] {
   const ordered: HallMessage[] = [];
   const seen = new Set<string>();
@@ -987,12 +926,21 @@ function buildHallRuntimeResult(input: {
   );
   const operatorIntent = resolveHallOperatorIntent(dispatch);
   const directResponseIntent = isDirectResponseIntent(operatorIntent) ? operatorIntent : undefined;
-  const visibleContent = dispatch.mode === "discussion"
-    ? (directResponseIntent
-        ? sanitizeDirectTaskVisibleRuntimeText(dispatch, content)
-        : sanitizeDiscussionVisibleRuntimeText(dispatch, content))
-    : compactHallCoworkerReply(content, responseLanguage);
-  const kind = resolveHallRuntimeMessageKind(dispatch, directResponseIntent);
+  const visibleContentBase = formatHallVisibleContentForMode(
+    dispatch,
+    content,
+    responseLanguage,
+    directResponseIntent,
+  );
+  const visibleContent = ensureNonEmptyHallVisibleRuntimeText(
+    dispatch,
+    visibleContentBase,
+    structured,
+    responseLanguage,
+    directResponseIntent,
+    true,
+  );
+  let kind = resolveHallRuntimeMessageKind(dispatch, directResponseIntent);
   const payload: HallMessage["payload"] = {
     taskStage: dispatch.taskCard.stage,
     taskStatus: dispatch.taskCard.status,
@@ -1006,6 +954,25 @@ function buildHallRuntimeResult(input: {
     latestSummary: structured.latestSummary ?? visibleContent,
   };
   const normalizedNextAction = normalizeImplicitHallExecutionNextAction(dispatch, structured, content);
+  const currentExecutionItem = dispatch.mode === "discussion"
+    ? undefined
+    : resolveCurrentExecutionItem(dispatch.taskCard, dispatch.participant.participantId);
+  const queuedNextParticipantId = currentExecutionItem
+    ? (currentExecutionItem.handoffToParticipantId?.trim() || "")
+    : (dispatch.taskCard.plannedExecutionOrder[0] || "");
+  const queuedNextParticipant = queuedNextParticipantId
+    ? dispatch.hall.participants.find((participant) => participant.participantId === queuedNextParticipantId)
+    : undefined;
+  const preferVisibleDeliverableCompletion = shouldPreferVisibleDeliverableCompletion(
+    dispatch,
+    structured,
+    content,
+    currentExecutionItem,
+    queuedNextParticipant,
+  );
+  const ignoreStructuredBlockSignals = preferVisibleDeliverableCompletion
+    || normalizedNextAction === "handoff"
+    || normalizedNextAction === "review";
   const concreteDeliverable = enforceConcreteDeliverableReply(
     dispatch,
     visibleContent,
@@ -1013,7 +980,12 @@ function buildHallRuntimeResult(input: {
     responseLanguage,
     directResponseIntent,
   );
+  if (concreteDeliverable.messageKindOverride) {
+    kind = concreteDeliverable.messageKindOverride;
+  }
   if (concreteDeliverable.suppressVisibleMessage) {
+    taskCardPatch.latestSummary = dispatch.taskCard.latestSummary ?? taskCardPatch.latestSummary;
+  } else if (concreteDeliverable.preserveExistingSummary) {
     taskCardPatch.latestSummary = dispatch.taskCard.latestSummary ?? taskCardPatch.latestSummary;
   }
 
@@ -1100,8 +1072,8 @@ function buildHallRuntimeResult(input: {
       payload.doneWhen = structured.doneWhen;
       taskCardPatch.doneWhen = structured.doneWhen;
     }
-    if (structured.blockers) taskCardPatch.blockers = structured.blockers;
-    if (structured.requiresInputFrom) taskCardPatch.requiresInputFrom = structured.requiresInputFrom;
+    if (structured.blockers && !ignoreStructuredBlockSignals) taskCardPatch.blockers = structured.blockers;
+    if (structured.requiresInputFrom && !ignoreStructuredBlockSignals) taskCardPatch.requiresInputFrom = structured.requiresInputFrom;
   }
 
   const implicitExecutor = undefined;
@@ -1127,10 +1099,7 @@ export function compactHallCoworkerReply(content: string, language: HallResponse
     .replace(/<br\s*\/?>/gi, "\n")
     .trim();
   if (!normalized) return content;
-  if (looksLikeConcreteExecutionDeliverable(normalized)) {
-    const maxLength = language === "zh" ? 2200 : 4200;
-    return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1).trim()}…` : normalized;
-  }
+  if (looksLikeConcreteExecutionDeliverable(normalized)) return normalized;
   const rawSegments = normalized
     .split(/\n+/)
     .flatMap((line) => line.split(language === "zh" ? /(?<=[。！？])/ : /(?<=[.!?])\s+/))
@@ -1143,23 +1112,7 @@ export function compactHallCoworkerReply(content: string, language: HallResponse
     return !/^(我先把|当前结果是|现阶段|一句话先锁|我这边先|这版先|我建议下一步|建议下一步|这里最重要的是|基于现有上下文|从.*角度来看|I want to clarify|At this stage|Current result:|Here is the current state|For this round|At this point|Based on the current context|The key thing is)/i.test(segment);
   });
   if (segments.length === 0) return normalized;
-  const scored = segments
-    .map((segment, index) => ({
-      segment,
-      index,
-      score:
-        (/@/.test(segment) ? 5 : 0) +
-        (/(下一步|接着|交给|接棒|继续|must-fix|blocker|卡住|review|handoff|next step|pass to|hand off)/i.test(segment) ? 3 : 0) +
-        (/(完成|锁住|改完|补完|done|ready|shipped|landed)/i.test(segment) ? 2 : 0) +
-        (segment.length <= (language === "zh" ? 48 : 90) ? 1 : 0),
-    }))
-    .sort((left, right) => right.score - left.score || left.index - right.index)
-    .slice(0, 2)
-    .sort((left, right) => left.index - right.index)
-    .map((item) => item.segment);
-  const joined = scored.join("<br>");
-  const maxLength = language === "zh" ? 1200 : 2400;
-  return joined.length > maxLength ? `${joined.slice(0, maxLength - 1).trim()}…` : joined;
+  return segments.join("<br>");
 }
 
 function looksLikeConcreteExecutionDeliverable(content: string): boolean {
@@ -1167,7 +1120,7 @@ function looksLikeConcreteExecutionDeliverable(content: string): boolean {
   if (!normalized) return false;
   const deliverableListCount = countListLikeDeliverableItems(content);
   const quotedItemCount = countQuotedDeliverableItems(content);
-  const inlineEnumeratedSteps = [...normalized.matchAll(/(?:^|[\s，,:：;；(（])([1-9])[、,.，．]\s*([^0-9][^]*?)(?=(?:[\s，,:：;；(（][1-9][、,.，．]\s*)|$)/g)];
+  const inlineEnumeratedSteps = [...normalized.matchAll(/(?:^|[\s，,:：;；(（。！？.!?])([1-9])[、,.，．]\s*([^0-9][^]*?)(?=(?:[\s，,:：;；(（。！？.!?][1-9][、,.，．]\s*)|$)/g)];
   const hasInlineEnumeration = new Set(inlineEnumeratedSteps.map((match) => match[1])).size >= 2;
   return /(^|\n)\s*([0-9]+\.)\s/.test(content)
     || hasInlineEnumeration
@@ -1197,12 +1150,38 @@ export function enforceConcreteDeliverableReply(
   if (nextAction === "blocked" || looksLikeBlockedExecutionUpdate(visibleContent)) {
     return { content: visibleContent, nextAction };
   }
+  const deliverableKind = resolveConcreteDeliverableKind(currentTask, operatorIntent);
   if (strictDirectAsk) {
-    const deliverableKind = resolveConcreteDeliverableKind(currentTask, operatorIntent);
-    if (matchesConcreteDeliverableKind(deliverableKind, visibleContent)) {
+    if (matchesConcreteDeliverableKind(deliverableKind, visibleContent, currentTask)) {
       return { content: visibleContent, nextAction };
     }
-  } else if (looksLikeConcreteExecutionDeliverable(visibleContent)) {
+    return {
+      content: visibleContent,
+      nextAction: "continue",
+      nextStep: buildConcreteDeliverableRetryInstruction(currentTask, language, operatorIntent),
+    };
+  }
+  if (deliverableKind !== "generic") {
+    if (matchesConcreteDeliverableKind(deliverableKind, visibleContent, currentTask)) {
+      return { content: visibleContent, nextAction };
+    }
+    if (looksLikeConcreteExecutionDeliverable(visibleContent)) {
+      return {
+        content: visibleContent,
+        nextAction: "continue",
+        nextStep: buildConcreteDeliverableRetryInstruction(currentTask, language, operatorIntent),
+        messageKindOverride: "status",
+        preserveExistingSummary: true,
+      };
+    }
+    return {
+      content: "",
+      nextAction: "continue",
+      suppressVisibleMessage: true,
+      nextStep: buildConcreteDeliverableRetryInstruction(currentTask, language, operatorIntent),
+    };
+  }
+  if (looksLikeConcreteExecutionDeliverable(visibleContent)) {
     return { content: visibleContent, nextAction };
   }
   return {
@@ -1219,7 +1198,7 @@ function countListLikeDeliverableItems(content: string): number {
     .replace(/\r\n/g, "\n");
   const lineMatches = normalized.match(/^\s*(?:开头\s*)?(?:[1-9]|[一二三四五六七八九])[、,.，．:：)\]]\s+/gmu) ?? [];
   const inlineMatches = [
-    ...normalized.matchAll(/(?:^|[\s，,:：;；(（])(?:开头\s*)?([1-9]|[一二三四五六七八九])[、,.，．:：)\]]\s*/gmu),
+    ...normalized.matchAll(/(?:^|[\s，,:：;；(（。！？.!?])(?:开头\s*)?([1-9]|[一二三四五六七八九])[、,.，．:：)\]]\s*/gmu),
   ];
   return Math.max(
     lineMatches.length,
@@ -1229,9 +1208,57 @@ function countListLikeDeliverableItems(content: string): number {
 
 function countQuotedDeliverableItems(content: string): number {
   const normalized = content.replace(/<br\s*\/?>/gi, "\n");
-  const chinese = normalized.match(/[“]([^”\n]{4,160})[”]/g) ?? [];
-  const english = normalized.match(/["]([^"\n]{4,160})["]/g) ?? [];
+  const chinese = normalized.match(/[“]([^”\n]{4,800})[”]/g) ?? [];
+  const english = normalized.match(/["]([^"\n]{4,800})["]/g) ?? [];
   return chinese.length + english.length;
+}
+
+function countStandaloneQuotedParagraphs(content: string): number {
+  const normalized = content
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/\r\n/g, "\n");
+  return normalized
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^[“"][^”"\n]{24,1200}[”"]$/.test(line))
+    .length;
+}
+
+function countLongDeliverableParagraphs(content: string): number {
+  const normalized = content
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/\r\n/g, "\n");
+  return normalized
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !/^@/.test(line))
+    .filter((line) => !/^(这\s*[0-9一二三两]+\s*个(开头|版本|方案)|[0-9一二三两]+\s*个(开头|版本|方案)先|开头先|先锁住)/.test(line))
+    .filter((line) => line.length >= 40)
+    .length;
+}
+
+function resolveRequestedDeliverableCount(task: string | undefined): number {
+  const normalized = String(task || "").trim();
+  if (!normalized) return 1;
+  if (/(?:exactly\s*)?(?:three|3)\b|3\s*(?:个|条|版|种|份)|三\s*(?:个|条|版|种|份)/i.test(normalized)) {
+    return 3;
+  }
+  if (/\b(?:one|single|1)\b|1\s*(?:个|条|版|种|份)|一\s*(?:个|条|版|种|份)/i.test(normalized)) {
+    return 1;
+  }
+  return 1;
+}
+
+function looksLikeSpokenOpeningBundle(content: string): boolean {
+  const normalized = sanitizeHallVisibleRuntimeText(content)
+    .replace(/<br\s*\/?>/gi, "\n")
+    .trim();
+  if (!normalized) return false;
+  const quotedParagraphCount = countStandaloneQuotedParagraphs(normalized);
+  const longParagraphCount = countLongDeliverableParagraphs(normalized);
+  return /(这\s*[0-9一二三两]+\s*个开头|[0-9一二三两]+\s*个开头先|完整.*视频开头|完整可口播.*开头|可直接口播)/i.test(normalized)
+    && (quotedParagraphCount >= 3 || longParagraphCount >= 3);
 }
 
 function resolveConcreteDeliverableKind(
@@ -1239,10 +1266,14 @@ function resolveConcreteDeliverableKind(
   operatorIntent?: HallOperatorIntent,
 ): ConcreteDeliverableKind {
   const normalized = String(task || "").trim();
-  if (operatorIntent?.type === "review_request" || /(must-fix|review|审核|评审|检查|挑一下|挑出|只挑|硬问题|硬缺口)/i.test(normalized)) {
+  const normalizedIntentSource = normalizeHallIntentSourceText(normalized);
+  if (
+    operatorIntent?.type === "review_request"
+    || /(must-fix|review only|审核|评审|检查上一位结果|挑一下|挑出|只挑|硬问题|硬缺口)/i.test(normalized)
+  ) {
     return "review";
   }
-  if (operatorIntent?.type === "repo_scan_request" || /(repo|repository|codebase|source code|scan code|scan the repo|implementation|file path|workspace|代码|源码|仓库|扫描代码|扫代码|实现|文件)/i.test(normalized)) {
+  if (operatorIntent?.type === "repo_scan_request" || looksLikeRepoInspectionRequest(normalizedIntentSource)) {
     return "repo_scan";
   }
   if (/(thumbnail|缩略图)/i.test(normalized) && /(url|链接|image|图)/i.test(normalized)) {
@@ -1263,14 +1294,21 @@ function resolveConcreteDeliverableKind(
   return "generic";
 }
 
-function matchesConcreteDeliverableKind(kind: ConcreteDeliverableKind, content: string): boolean {
+function matchesConcreteDeliverableKind(
+  kind: ConcreteDeliverableKind,
+  content: string,
+  task?: string,
+): boolean {
   const normalized = sanitizeHallVisibleRuntimeText(content)
     .replace(/<br\s*\/?>/gi, "\n")
     .trim();
   if (!normalized) return false;
+  const requiredCount = resolveRequestedDeliverableCount(task);
   const listCount = countListLikeDeliverableItems(normalized);
   const quoteCount = countQuotedDeliverableItems(normalized);
-  const pathMatches = normalized.match(/(?:^|[\s:(])(?:\/[^\s:]+?\.(?:ts|tsx|js|jsx|md|html)|src\/[A-Za-z0-9._/-]+?\.(?:ts|tsx|js|jsx|md|html))/g) ?? [];
+  const quotedParagraphCount = countStandaloneQuotedParagraphs(normalized);
+  const longParagraphCount = countLongDeliverableParagraphs(normalized);
+  const pathMatches = normalized.match(/(?:\/[^\s、，,:：;；()（）]+?\.(?:ts|tsx|js|jsx|md|html)|src\/[A-Za-z0-9._/-]+?\.(?:ts|tsx|js|jsx|md|html))/g) ?? [];
   const urlMatches = normalized.match(/(?:https?:\/\/|file:\/\/\/)[^\s]+/gi) ?? [];
 
   switch (kind) {
@@ -1283,28 +1321,88 @@ function matchesConcreteDeliverableKind(kind: ConcreteDeliverableKind, content: 
     case "review":
       return /(must-fix|不过|通过|pass|clean pass|硬问题|硬缺口|可以过|需要改)/i.test(normalized);
     case "thumbnail_urls":
-      return urlMatches.length >= 3;
+      return urlMatches.length >= requiredCount;
     case "thumbnail_ideas":
-      return listCount >= 3 || quoteCount >= 3;
+      return listCount >= requiredCount
+        || quoteCount >= requiredCount
+        || (requiredCount <= 1 && /(thumbnail|缩略图)/i.test(normalized) && normalized.length >= 24);
     case "spoken_openings":
       return /开头\s*[123一二三]/i.test(normalized)
-        || (quoteCount >= 3 && pathMatches.length === 0)
+        || (quoteCount >= requiredCount && pathMatches.length === 0)
+        || (quotedParagraphCount >= requiredCount && pathMatches.length === 0)
+        || (looksLikeSpokenOpeningBundle(normalized) && pathMatches.length === 0)
         || (
-          listCount >= 3
+          listCount >= requiredCount
+          && pathMatches.length === 0
+          && !/(src\/|runtime|dispatch|orchestrator|\.ts\b|README|代码|源码|文件路径|file path)/i.test(normalized)
+        )
+        || (
+          requiredCount <= 1
+          && longParagraphCount >= 1
           && pathMatches.length === 0
           && !/(src\/|runtime|dispatch|orchestrator|\.ts\b|README|代码|源码|文件路径|file path)/i.test(normalized)
         );
     case "hooks":
-      return listCount >= 3 || quoteCount >= 3;
+      return listCount >= requiredCount || quoteCount >= requiredCount;
     case "script":
       return listCount >= 2
         || quoteCount >= 3
         || normalized.split("\n").filter((line) => line.trim().length > 0).length >= 3
-        || normalized.length >= 160;
+        || normalized.length >= 160
+        || (requiredCount <= 1 && /(script|脚本|台词|分镜|storyboard)/i.test(task ?? normalized) && (urlMatches.length >= 1 || normalized.length >= 20));
     case "generic":
     default:
       return looksLikeConcreteExecutionDeliverable(normalized);
   }
+}
+
+function hasAnyVisibleParticipantMention(content: string): boolean {
+  return /(^|[\s(>\[\{<,.;:!?"'“”‘’，。！？；：、）】」』》])@[A-Za-z0-9_\-\u4e00-\u9fff]+/.test(
+    sanitizeHallVisibleRuntimeText(content),
+  );
+}
+
+function resolveVisibleExecutionCompletion(input: {
+  dispatch: HallRuntimeDispatchInput;
+  content: string;
+  currentExecutionItem?: HallExecutionItem;
+  nextParticipant?: HallParticipant;
+}): {
+  concreteDeliverable: boolean;
+  explicitHandoffToNext: boolean;
+  hasAnyVisibleHandoffMention: boolean;
+  seemsComplete: boolean;
+  completedWithVisibleHandoff: boolean;
+} {
+  const { dispatch, content, currentExecutionItem, nextParticipant } = input;
+  const currentTask = currentExecutionItem?.task ?? "";
+  const deliverableKind = resolveConcreteDeliverableKind(currentTask);
+  const visibleContent = sanitizeHallVisibleRuntimeText(content);
+  const mentionedNextParticipant = nextParticipant
+    ? detectExplicitMentionedParticipant(dispatch.hall, visibleContent, dispatch.participant.participantId)
+    : undefined;
+  const explicitHandoffToNext = Boolean(
+    nextParticipant
+    && mentionedNextParticipant
+    && mentionedNextParticipant.participantId === nextParticipant.participantId,
+  );
+  const hasAnyVisibleHandoffMention = hasAnyVisibleParticipantMention(visibleContent);
+  const concreteDeliverable = matchesConcreteDeliverableKind(deliverableKind, visibleContent, currentTask)
+    || looksLikeConcreteExecutionDeliverable(visibleContent);
+  const seemsComplete = looksLikeCompletedExecutionUpdate(visibleContent)
+    || explicitHandoffToNext;
+  const completedWithVisibleHandoff = concreteDeliverable && (
+    nextParticipant && nextParticipant.participantId !== dispatch.participant.participantId
+      ? (explicitHandoffToNext || seemsComplete)
+      : seemsComplete
+  );
+  return {
+    concreteDeliverable,
+    explicitHandoffToNext,
+    hasAnyVisibleHandoffMention,
+    seemsComplete,
+    completedWithVisibleHandoff,
+  };
 }
 
 function normalizeImplicitHallExecutionNextAction(
@@ -1312,10 +1410,7 @@ function normalizeImplicitHallExecutionNextAction(
   structured: ParsedStructuredBlock,
   content: string,
 ): HallRuntimeNextAction | undefined {
-  if (structured.nextAction) return structured.nextAction;
   if (dispatch.mode === "discussion") return undefined;
-  if ((structured.blockers?.length ?? 0) > 0) return "blocked";
-  if (looksLikeBlockedExecutionUpdate(content)) return "blocked";
 
   const currentExecutionItem = resolveCurrentExecutionItem(dispatch.taskCard, dispatch.participant.participantId);
   const queuedNextParticipantId = currentExecutionItem
@@ -1324,6 +1419,21 @@ function normalizeImplicitHallExecutionNextAction(
   const nextParticipant = queuedNextParticipantId
     ? dispatch.hall.participants.find((participant) => participant.participantId === queuedNextParticipantId)
     : undefined;
+  const visibleCompletion = resolveVisibleExecutionCompletion({
+    dispatch,
+    content,
+    currentExecutionItem,
+    nextParticipant,
+  });
+  if (visibleCompletion.completedWithVisibleHandoff) {
+    return nextParticipant && nextParticipant.participantId !== dispatch.participant.participantId ? "handoff" : "review";
+  }
+  if (shouldPreferVisibleDeliverableCompletion(dispatch, structured, content, currentExecutionItem, nextParticipant)) {
+    return nextParticipant && nextParticipant.participantId !== dispatch.participant.participantId ? "handoff" : "review";
+  }
+  if (structured.nextAction) return structured.nextAction;
+  if ((structured.blockers?.length ?? 0) > 0) return "blocked";
+  if (looksLikeBlockedExecutionUpdate(content)) return "blocked";
   if (dispatch.mode === "handoff" && nextParticipant && nextParticipant.participantId !== dispatch.participant.participantId) {
     if (looksLikeNeedsAnotherPass(content)) return "continue";
     return "handoff";
@@ -1337,6 +1447,30 @@ function normalizeImplicitHallExecutionNextAction(
   return "review";
 }
 
+function shouldPreferVisibleDeliverableCompletion(
+  dispatch: HallRuntimeDispatchInput,
+  structured: ParsedStructuredBlock,
+  content: string,
+  currentExecutionItem: HallExecutionItem | undefined,
+  nextParticipant: HallParticipant | undefined,
+): boolean {
+  if (dispatch.mode === "discussion") return false;
+  if (looksLikeBlockedExecutionUpdate(content) || looksLikeNeedsAnotherPass(content)) return false;
+  const hiddenBlockSignal =
+    structured.nextAction === "blocked"
+    || structured.nextAction === "continue"
+    || (structured.blockers?.length ?? 0) > 0
+    || (structured.requiresInputFrom?.length ?? 0) > 0;
+  if (!hiddenBlockSignal) return false;
+  const visibleCompletion = resolveVisibleExecutionCompletion({
+    dispatch,
+    content,
+    currentExecutionItem,
+    nextParticipant,
+  });
+  return visibleCompletion.completedWithVisibleHandoff;
+}
+
 function looksLikeCompletedExecutionUpdate(content: string): boolean {
   const normalized = content.replace(/\s+/g, " ").trim();
   if (!normalized) return false;
@@ -1347,6 +1481,7 @@ function looksLikeCompletedExecutionUpdate(content: string): boolean {
 function requiresConcreteDeliverableForStep(task: string | undefined): boolean {
   const normalized = String(task || "").trim();
   if (!normalized) return true;
+  if (resolveConcreteDeliverableKind(normalized) !== "generic") return true;
   if (/(承接上一步|继续推进|继续做|继续这一轮|收口这轮|检查上一位结果|指出必须修改项|review|评审|must-fix|硬问题|硬缺口|交接|handoff|next action)/i.test(normalized)) {
     return true;
   }
@@ -1448,13 +1583,19 @@ function looksLikeMetaExecutionDiscussion(content: string): boolean {
 }
 
 function looksLikeBlockedExecutionUpdate(content: string): boolean {
-  const normalized = content.replace(/\s+/g, " ").trim();
+  const normalized = sanitizeHallVisibleRuntimeText(content)
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   if (!normalized) return false;
   return /(卡住|阻塞|缺少|缺失|拿不到|没有.*(上下文|代码|文件|权限|信息)|无法|不能继续|still need|still missing|blocked on|blocked by|can't continue|cannot continue|need more context|need the repo|need the file)/i.test(normalized);
 }
 
 function looksLikeNeedsAnotherPass(content: string): boolean {
-  const normalized = content.replace(/\s+/g, " ").trim();
+  const normalized = sanitizeHallVisibleRuntimeText(content)
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   if (!normalized) return false;
   if (looksLikeBlockedExecutionUpdate(normalized)) return false;
   return /(我先再|我还要再|我再补一轮|我再改一轮|我先继续改|我先补完|需要我再|我继续把这一步|one more pass|another pass|i will revise|i'll revise|i will keep refining|i'll keep refining|i need one more pass|let me tighten this)/i.test(normalized);
@@ -1562,8 +1703,26 @@ function detectExplicitMentionedParticipant(
 
 function pickExpectedSessionKey(taskCard: HallTaskCard, agentId: string): string | undefined {
   const normalizedAgentId = normalizeLookup(agentId);
+  if (!normalizedAgentId) return undefined;
+  const threadScoped = buildHallThreadScopedSessionKey(taskCard, agentId);
   const linked = taskCard.sessionKeys.find((sessionKey) => normalizeLookup(sessionKey).includes(`agent:${normalizedAgentId}:`));
-  return linked ?? (normalizedAgentId ? `agent:${agentId}:main` : undefined);
+  const linkedThreadScoped = threadScoped
+    ? taskCard.sessionKeys.find((sessionKey) => normalizeLookup(sessionKey) === normalizeLookup(threadScoped))
+    : undefined;
+  if (linkedThreadScoped) return linkedThreadScoped;
+  if (linked && !isLegacySharedHallSessionKey(linked, agentId)) return linked;
+  return threadScoped ?? linked;
+}
+
+function buildHallThreadScopedSessionKey(taskCard: HallTaskCard, agentId: string): string | undefined {
+  const normalizedAgentId = normalizeLookup(agentId);
+  const taskScope = normalizeLookup(taskCard.taskId || taskCard.taskCardId || "");
+  if (!normalizedAgentId || !taskScope) return undefined;
+  return `agent:${agentId}:hall:${taskScope}`;
+}
+
+function isLegacySharedHallSessionKey(sessionKey: string, agentId: string): boolean {
+  return normalizeLookup(sessionKey) === normalizeLookup(`agent:${agentId}:main`);
 }
 
 async function safeReadHistory(client: ToolClient, sessionKey: string): Promise<SessionHistoryMessage[]> {
@@ -1670,6 +1829,52 @@ function buildFallbackVisibleContent(input: HallRuntimeDispatchInput, rawText: s
     : `${input.participant.displayName} moved this step forward.`;
 }
 
+function formatHallVisibleContentForMode(
+  input: HallRuntimeDispatchInput,
+  raw: string,
+  language: HallResponseLanguage,
+  directResponseIntent: HallOperatorIntent | undefined,
+): string {
+  return input.mode === "discussion"
+    ? (directResponseIntent
+        ? sanitizeDirectTaskVisibleRuntimeText(input, raw)
+        : sanitizeDiscussionVisibleRuntimeText(input, raw))
+    : compactHallCoworkerReply(raw, language);
+}
+
+function ensureNonEmptyHallVisibleRuntimeText(
+  input: HallRuntimeDispatchInput,
+  visibleContent: string,
+  structured: ParsedStructuredBlock,
+  language: HallResponseLanguage,
+  directResponseIntent: HallOperatorIntent | undefined,
+  allowGenericFallback: boolean,
+): string {
+  const normalizedVisible = sanitizeHallVisibleRuntimeText(visibleContent);
+  if (normalizedVisible) return visibleContent.trim();
+
+  const structuredFallbackRaw = [
+    structured.latestSummary,
+    structured.decision,
+    structured.proposal,
+    structured.doneWhen,
+  ].find((candidate) => sanitizeHallVisibleRuntimeText(candidate));
+
+  if (structuredFallbackRaw) {
+    const structuredFallback = formatHallVisibleContentForMode(
+      input,
+      structuredFallbackRaw,
+      language,
+      directResponseIntent,
+    ).trim();
+    if (sanitizeHallVisibleRuntimeText(structuredFallback)) {
+      return structuredFallback;
+    }
+  }
+
+  return allowGenericFallback ? buildFallbackVisibleContent(input, structured.latestSummary ?? "") : "";
+}
+
 function sanitizeDiscussionVisibleRuntimeText(
   dispatch: HallRuntimeDispatchInput,
   raw: string,
@@ -1731,38 +1936,11 @@ export function compactHallDiscussionReply(content: string, language: HallRespon
     .replace(/<br\s*\/?>/gi, "\n")
     .trim();
   if (!normalized) return content;
-
-  const rawSegments = normalized
+  return normalized
     .split(/\n+/)
-    .flatMap((line) => line.split(language === "zh" ? /(?<=[。！？])/ : /(?<=[.!?])\s+/))
     .map((line) => line.trim())
-    .filter(Boolean);
-
-  const seen = new Set<string>();
-  const segments = rawSegments.filter((segment) => {
-    if (seen.has(segment)) return false;
-    seen.add(segment);
-    return !/^(先锁一个点|我只补一个点|再补一个点|再补个风险|一句话先锁|One angle|One gap|One missing piece|I only want to add one point)/i.test(segment)
-      && !/(数据缺失|未验证素材|验收标准|创意约束|not a verified finding|validation constraint)/i.test(segment);
-  });
-
-  if (segments.length === 0) return normalized;
-
-  const scored = segments
-    .map((segment, index) => ({
-      segment,
-      index,
-      score:
-        (/@/.test(segment) ? 4 : 0) +
-        (/(风险|缺口|要补|最好|只要|必须|关键|next action|owner|blocker|must-fix|need|should|missing|risk)/i.test(segment) ? 3 : 0) +
-        (segment.length <= (language === "zh" ? 72 : 120) ? 1 : 0),
-    }))
-    .sort((left, right) => right.score - left.score || left.index - right.index)
-    .slice(0, 2)
-    .sort((left, right) => left.index - right.index)
-    .map((item) => item.segment);
-
-  return scored.join("<br>");
+    .filter(Boolean)
+    .join("<br>");
 }
 
 function sanitizeManagerDiscussionText(
@@ -1959,6 +2137,30 @@ function inferArtifactLabelFromLocation(location: string): string {
 
 function sanitizeDirectRuntimeOutput(raw: string): string {
   return sanitizeHallVisibleRuntimeText(raw);
+}
+
+function formatHallRuntimeDraftVisibleText(
+  input: HallRuntimeDispatchInput,
+  raw: string | undefined,
+): string {
+  const parsed = extractStructuredBlock(String(raw ?? ""));
+  const responseLanguage = inferHallResponseLanguage(
+    `${raw ?? ""}\n${input.triggerMessage?.content ?? ""}\n${input.taskCard.title}\n${input.taskCard.description}`,
+  );
+  const operatorIntent = resolveHallOperatorIntent(input);
+  const directResponseIntent = isDirectResponseIntent(operatorIntent) ? operatorIntent : undefined;
+  const sanitized = sanitizeDirectRuntimeOutput(parsed.visibleText || raw || "");
+  const visibleContentBase = input.mode !== "discussion"
+    ? sanitized
+    : formatHallVisibleContentForMode(input, sanitized, responseLanguage, directResponseIntent);
+  return ensureNonEmptyHallVisibleRuntimeText(
+    input,
+    visibleContentBase,
+    parsed.structured,
+    responseLanguage,
+    directResponseIntent,
+    false,
+  );
 }
 
 function sanitizeHallVisibleRuntimeText(raw: string | undefined): string {
