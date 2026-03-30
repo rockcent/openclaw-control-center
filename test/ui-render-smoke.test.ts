@@ -207,7 +207,7 @@ test("collaboration section is a standalone dashboard page with inline thread ex
   assert(source.includes('label: "Collaboration", blurb: "Agent handoffs and teamwork"'));
   assert(source.includes('label: "协作", blurb: "智能体交接与协同"'));
   assert(source.includes('activeSection === "collaboration"'));
-  assert(source.includes('const collaborationSection = `'));
+  assert(source.includes('const collaborationSection = activeSection === "collaboration" ? `'));
   assert(source.includes('id="collaboration-hub"'));
   assert(source.includes('id="collaboration-board"'));
   assert(source.includes('t("Team collaboration", "团队协作")'));
@@ -401,6 +401,41 @@ test("dashboard keeps global visibility as overview-only block", async () => {
   assert(source.includes("确定性判断"));
 });
 
+test("dashboard desktop layout keeps sidebars fixed while main content scrolls locally", async () => {
+  const source = await readFile("src/ui/server.ts", "utf8");
+
+  assert(source.includes("min-height: 100dvh;"));
+  assert(source.includes("height: 100dvh;"));
+  assert(source.includes("overflow: hidden;"));
+  assert(source.includes("overflow-y: auto;"));
+  assert(source.includes("scrollbar-gutter: stable;"));
+  assert(source.includes(".sidebar::-webkit-scrollbar,"));
+  assert(source.includes("body:not(.section-hall-chat) .app-shell {"));
+  assert(source.includes("grid-template-rows: auto minmax(0, 1fr);"));
+  assert(source.includes("body:not(.section-hall-chat) .panel {"));
+  assert(source.includes("body:not(.section-hall-chat) .inspector-sidebar {"));
+});
+
+test("dashboard only loads replay and avatar diagnostics for sections that actually need them", async () => {
+  const source = await readFile("src/ui/server.ts", "utf8");
+
+  assert(source.includes('const needsReplayPreview = activeSection === "replay-audit";'));
+  assert(source.includes('const needsAvatarPreferences = activeSection === "team";'));
+  assert(source.includes("needsReplayPreview ? loadCachedReplayPreview() : Promise.resolve(emptyReplayPreview())"));
+  assert(source.includes("needsAvatarPreferences"));
+  assert(source.includes("defaultAvatarPreferences(snapshot.generatedAt)"));
+});
+
+test("dashboard warmup avoids replay preloading and deduplicates office presence loads", async () => {
+  const source = await readFile("src/ui/server.ts", "utf8");
+
+  assert(source.includes("let renderOfficePresenceInFlight: Promise<OfficeSessionPresenceSnapshot> | undefined;"));
+  assert(source.includes("if (renderOfficePresenceInFlight) {"));
+  assert(source.includes("renderOfficePresenceInFlight = nextValue;"));
+  assert(source.includes('await Promise.all([loadCachedUsageCost(snapshot, "full"), loadCachedOfficeSessionPresence()]);'));
+  assert(!source.includes('await Promise.all([loadCachedUsageCost(snapshot, "full"), loadCachedOfficeSessionPresence(), loadCachedReplayPreview()]);'));
+});
+
 test("heartbeat API routes are implemented in UI server", async () => {
   const source = await readFile("src/ui/server.ts", "utf8");
   assert(source.includes('if (method === "GET" && path === "/api/tasks/heartbeat")'));
@@ -448,10 +483,19 @@ test("dashboard wires CLI insight cards into overview, usage, memory, and settin
   assert(source.includes('id="overview-connection-health"'));
   assert(source.includes('pickUiText(language, "Connection health", "接线状态")'));
   assert(source.includes('pickUiText(language, "Gateway", "网关")'));
+  assert(source.includes('pickUiText(language, "Official panel", "官方控制面板")'));
+  assert(source.includes('pickUiText(language, "Official panel guide", "官方控制面板说明")'));
+  assert(source.includes('pickUiText(language, "OpenClaw Dashboard ↗", "OpenClaw 官方面板 ↗")'));
+  assert(source.includes('href="https://app.openclaw.ai"'));
+  assert(source.includes('id="diagnostics-card"'));
+  assert(source.includes('t("Diagnostics bundle", "诊断包")'));
+  assert(source.includes('href="/api/diagnostics"'));
+  assert(source.includes('href="/api/diagnostics?format=text"'));
   assert(source.includes('6 项关键用量数据里，已经接上 ${connectedCount} 项，还差 1 项：${gapLabel}。${impact}${action}'));
   assert(source.includes("去设置页补上订阅或账单快照即可。"));
   assert(source.includes('const needsConnectionHealth = activeSection === "settings";'));
-  assert(source.includes("const settingsSection = `\n    ${connectionHealthCard}"));
+  assert(source.includes('const settingsSection = activeSection === "settings" ? `'));
+  assert(source.includes("${connectionHealthCard}"));
   assert(source.includes('id="session-context-pressure"'));
   assert(source.includes('pickUiText(language, "Context pressure", "上下文压力")'));
   assert(source.includes("</section>\n    ${contextPressureCard}\n    <details class=\"card compact-details\">"));
@@ -861,4 +905,17 @@ test("subscription card normalizes near-week minute labels before rendering", as
   assert(html.includes(">Week<"));
   assert(!html.includes(">300m<"));
   assert(!html.includes(">10081m<"));
+});
+
+test("ui sources never inject LOCAL_API_TOKEN into rendered HTML", async () => {
+  const [serverSource, hallSource, roomSource] = await Promise.all([
+    readFile("src/ui/server.ts", "utf8"),
+    readFile("src/ui/collaboration-hall.ts", "utf8"),
+    readFile("src/ui/task-room-workbench.ts", "utf8"),
+  ]);
+
+  assert(!serverSource.includes("data-local-token-value"));
+  assert(!serverSource.includes("dataset?.localTokenValue"));
+  assert(!hallSource.includes("dataset?.localTokenValue"));
+  assert(!roomSource.includes("dataset?.localTokenValue"));
 });

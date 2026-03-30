@@ -255,6 +255,9 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
   const textAdjustExecutionOrder = ${JSON.stringify(pickUiText(language, "Adjust execution order", "调整执行顺序"))};
   const textContinueDiscussion = ${JSON.stringify(pickUiText(language, "Continue discussion", "继续讨论"))};
   const textContinueDiscussionSeed = ${JSON.stringify(pickUiText(language, "Let's keep this in discussion for a moment.", "我们先继续讨论这一步，不急着收口。"))};
+  const textNeedToken = ${JSON.stringify(pickUiText(language, "This action requires LOCAL_API_TOKEN.", "这个动作需要 LOCAL_API_TOKEN。"))};
+  const textTokenPrompt = ${JSON.stringify(pickUiText(language, "Enter LOCAL_API_TOKEN to continue.", "请输入 LOCAL_API_TOKEN 以继续。"))};
+  const textTokenRetryPrompt = ${JSON.stringify(pickUiText(language, "The local token was rejected. Enter LOCAL_API_TOKEN again to retry.", "本地令牌验证失败，请重新输入 LOCAL_API_TOKEN 以重试。"))};
   const textQueuedOwners = ${JSON.stringify(pickUiText(language, "Queued owners", "后续顺序"))};
   const textPlanningOrder = ${JSON.stringify(pickUiText(language, "Execution order", "执行顺序"))};
   const textPlannerHint = ${JSON.stringify(pickUiText(language, "Set who should work, what they should do, and when they should hand off.", "设置谁来做、做什么、什么时候交接。"))};
@@ -343,6 +346,8 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
   const mentionList = root.querySelector('[data-hall-mention-list]');
   const contextToggles = [...root.querySelectorAll('[data-hall-toggle-context]')];
   const tokenKey = 'openclaw:local-api-token';
+  const tokenHeader = ((document.body?.dataset?.localTokenHeader || 'x-local-token').trim() || 'x-local-token');
+  const tokenGateRequired = (document.body?.dataset?.tokenRequired || '') === '1';
   let isComposing = false;
   let selectedTaskCardId = String(bootstrap.selectedTaskCardId || '');
   let selectedTaskProjectId = '';
@@ -627,14 +632,22 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
   };
   const readToken = () => {
     try {
-      const stored = window.localStorage.getItem(tokenKey) || '';
-      if (stored) return stored;
+      return (window.localStorage.getItem(tokenKey) || '').trim();
     } catch {}
-    const injected = (document.body?.dataset?.localTokenValue || '').trim();
-    return injected;
+    return '';
   };
   const writeToken = (token) => {
     try { window.localStorage.setItem(tokenKey, token || ''); } catch {}
+  };
+  const clearToken = () => {
+    try { window.localStorage.removeItem(tokenKey); } catch {}
+  };
+  const requestToken = (message) => {
+    const next = typeof window.prompt === 'function'
+      ? String(window.prompt(message || textNeedToken, '') || '').trim()
+      : '';
+    if (next) writeToken(next);
+    return next;
   };
   const syncSelectedTaskRefs = () => {
     if (!selectedTaskCardId || !Array.isArray(hallTaskCards)) return;
@@ -643,17 +656,10 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
     selectedTaskProjectId = selected.projectId || selectedTaskProjectId;
     selectedTaskId = selected.taskId || selectedTaskId;
   };
-  const ensureToken = () => {
-    let token = readToken();
-    if (token) {
-      writeToken(token);
-      return token;
-    }
-    return token;
-  };
-  const buildMutationHeaders = () => {
-    const headers = { 'content-type': 'application/json' };
-    return headers;
+  const ensureToken = (message) => {
+    const stored = readToken();
+    if (stored) return stored;
+    return requestToken(message || textTokenPrompt);
   };
   const syncTaskUrl = (taskCardId) => {
     try {
@@ -1830,12 +1836,51 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
       '</div>';
   };
 
+  const extractErrorMessage = (payload) => {
+    if (payload && payload.error && typeof payload.error === 'object' && payload.error.message) {
+      return payload.error.message;
+    }
+    return payload?.error || payload?.message || 'Request failed';
+  };
   const callJson = async (url, init) => {
     const response = await fetch(url, init);
-    const payload = await response.json();
+    const payload = await response.json().catch(() => ({}));
     if (!response.ok || payload?.ok === false) {
-      throw new Error(payload?.error || payload?.message || 'Request failed');
+      throw new Error(extractErrorMessage(payload));
     }
+    return payload;
+  };
+  const callMutationJson = async (url, init) => {
+    const requestOnce = async (token) => {
+      const headers = {
+        ...(init && init.headers ? init.headers : {}),
+      };
+      if (!Object.keys(headers).some((key) => key.toLowerCase() === 'content-type')) {
+        headers['content-type'] = 'application/json';
+      }
+      if (token) headers[tokenHeader] = token;
+      const response = await fetch(url, {
+        ...init,
+        headers,
+      });
+      const payload = await response.json().catch(() => ({}));
+      return { response, payload };
+    };
+    if (!tokenGateRequired) {
+      const { response, payload } = await requestOnce('');
+      if (!response.ok || payload?.ok === false) throw new Error(extractErrorMessage(payload));
+      return payload;
+    }
+    let token = ensureToken(textTokenPrompt);
+    if (!token) throw new Error(textNeedToken);
+    let { response, payload } = await requestOnce(token);
+    if (response.status === 401) {
+      clearToken();
+      token = requestToken(textTokenRetryPrompt);
+      if (!token) throw new Error(textNeedToken);
+      ({ response, payload } = await requestOnce(token));
+    }
+    if (!response.ok || payload?.ok === false) throw new Error(extractErrorMessage(payload));
     return payload;
   };
 
@@ -2026,11 +2071,8 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
     if (!(textarea instanceof HTMLTextAreaElement)) return;
     const content = textarea.value.trim();
     if (!content) return;
-    const headers = buildMutationHeaders();
-    if (!headers) return;
-    const payload = await callJson('/api/hall/tasks', {
+    const payload = await callMutationJson('/api/hall/tasks', {
       method: 'POST',
-      headers,
       body: JSON.stringify({ content }),
     });
     textarea.value = '';
@@ -2047,11 +2089,8 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
     if (!(textarea instanceof HTMLTextAreaElement)) return;
     const content = textarea.value.trim();
     if (!content) return;
-    const headers = buildMutationHeaders();
-    if (!headers) return;
-    await callJson('/api/hall/messages', {
+    await callMutationJson('/api/hall/messages', {
       method: 'POST',
-      headers,
       body: JSON.stringify({
         taskCardId: selectedTaskCardId || undefined,
         content,
@@ -2094,11 +2133,8 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
       setFlash('Unknown owner: ' + chosenParticipantId);
       return;
     }
-    const headers = buildMutationHeaders();
-    if (!headers) return;
-    await callJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/assign', {
+    await callMutationJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/assign', {
       method: 'POST',
-      headers,
       body: JSON.stringify({
         taskCardId: selectedTaskCardId,
         projectId: selectedTaskProjectId,
@@ -2132,11 +2168,8 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
         handoffWhen: String(item.handoffWhen || '').trim(),
       }))
       .filter((item) => item.participantId && item.task);
-    const headers = buildMutationHeaders();
-    if (!headers) return;
-    await callJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/execution-order', {
+    await callMutationJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/execution-order', {
       method: 'POST',
-      headers,
       body: JSON.stringify({
         taskCardId: selectedTaskCardId,
         projectId: selectedTaskProjectId,
@@ -2175,11 +2208,8 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
       return;
     }
     const note = '';
-    const headers = buildMutationHeaders();
-    if (!headers) return;
-    await callJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/review', {
+    await callMutationJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/review', {
       method: 'POST',
-      headers,
       body: JSON.stringify({
         taskCardId: selectedTaskCardId,
         projectId: selectedTaskProjectId,
@@ -2207,11 +2237,8 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
     const doneWhen = String(handoffDraft.doneWhen || '').trim();
     const blockers = String(handoffDraft.blockers || '').split(',').map((item) => item.trim()).filter(Boolean);
     const requiresInputFrom = String(handoffDraft.requiresInputFrom || '').split(',').map((item) => item.trim()).filter(Boolean);
-    const headers = buildMutationHeaders();
-    if (!headers) return;
-    await callJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/handoff', {
+    await callMutationJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/handoff', {
       method: 'POST',
-      headers,
       body: JSON.stringify({
         taskCardId: selectedTaskCardId,
         projectId: selectedTaskProjectId,
@@ -2268,13 +2295,10 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
       focusComposer();
       return false;
     }
-    const headers = buildMutationHeaders();
-    if (!headers) return false;
     const reopen = async () => {
       if (taskCard.stage === 'execution' || taskCard.stage === 'blocked') {
-        await callJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/stop', {
+        await callMutationJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/stop', {
           method: 'POST',
-          headers,
           body: JSON.stringify({
             taskCardId: selectedTaskCardId,
             projectId: selectedTaskProjectId,
@@ -2283,9 +2307,8 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
         });
         await loadHall(true);
       } else {
-        await callJson('/api/hall/messages', {
+        await callMutationJson('/api/hall/messages', {
           method: 'POST',
-          headers,
           body: JSON.stringify({
             taskCardId: selectedTaskCardId || undefined,
             content: textContinueDiscussionSeed,
@@ -2337,11 +2360,8 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
       setFlash(${JSON.stringify(pickUiText(language, "Select a task thread first.", "先选中一个任务线程。"))});
       return;
     }
-    const headers = buildMutationHeaders();
-    if (!headers) return;
-    await callJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/stop', {
+    await callMutationJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/stop', {
       method: 'POST',
-      headers,
       body: JSON.stringify({
         taskCardId: selectedTaskCardId,
       }),
@@ -2356,11 +2376,8 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
       return;
     }
     if (!window.confirm(textArchiveConfirm)) return;
-    const headers = buildMutationHeaders();
-    if (!headers) return;
-    await callJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/archive', {
+    await callMutationJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/archive', {
       method: 'POST',
-      headers,
       body: JSON.stringify({
         taskCardId: selectedTaskCardId,
         projectId: selectedTaskProjectId,
@@ -2385,11 +2402,8 @@ export function renderCollaborationHallClientScript(language: UiLanguage): strin
       return;
     }
     if (!window.confirm(textDeleteConfirm)) return;
-    const headers = buildMutationHeaders();
-    if (!headers) return;
-    await callJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/delete', {
+    await callMutationJson('/api/hall/tasks/' + encodeURIComponent(selectedTaskId) + '/delete', {
       method: 'POST',
-      headers,
       body: JSON.stringify({
         taskCardId: selectedTaskCardId,
         projectId: selectedTaskProjectId,

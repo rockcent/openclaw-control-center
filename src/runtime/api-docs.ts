@@ -65,6 +65,20 @@ export function buildApiDocs(): ApiDocsPayload {
       },
       {
         method: "GET",
+        path: "/api/diagnostics",
+        summary: "Operator-friendly diagnostics bundle for startup and connection triage",
+        query: {
+          format: "optional: text",
+        },
+        response: {
+          ok: "boolean (JSON mode only)",
+          diagnostics:
+            "{ app, runtime, gateway, openclaw, tokens(redacted presence only), recentIssues[] } (JSON mode)",
+          text: "plain-text diagnostics report when format=text",
+        },
+      },
+      {
+        method: "GET",
         path: "/api/ui/preferences",
         summary: "Read persisted dashboard UI preferences",
         response: {

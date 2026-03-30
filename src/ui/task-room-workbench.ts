@@ -52,6 +52,8 @@ export function renderTaskRoomWorkbench(input: RenderTaskRoomWorkbenchInput): st
       roomThread: t("Room timeline", "房间时间线"),
       runtimeEvidence: t("Runtime evidence is merged into this timeline when session links exist.", "只要房间里挂了会话，运行证据会自动并到这条时间线上。"),
       needToken: t("This action requires LOCAL_API_TOKEN.", "这个动作需要 LOCAL_API_TOKEN。"),
+      tokenPrompt: t("Enter LOCAL_API_TOKEN to continue.", "请输入 LOCAL_API_TOKEN 以继续。"),
+      tokenRetryPrompt: t("The local token was rejected. Enter LOCAL_API_TOKEN again to retry.", "本地令牌验证失败，请重新输入 LOCAL_API_TOKEN 以重试。"),
       assignNote: t("Optional handoff note", "可选交接备注"),
       rejectNote: t("Why should it change?", "为什么要打回？"),
       approveNote: t("Optional review note", "可选审核备注"),
@@ -144,6 +146,8 @@ export function renderTaskRoomClientScript(language: UiLanguage): string {
     rejectNote: pickUiText(language, "Why should it change?", "为什么要打回？"),
     approveNote: pickUiText(language, "Optional review note", "可选审核备注"),
     needToken: pickUiText(language, "This action requires LOCAL_API_TOKEN.", "这个动作需要 LOCAL_API_TOKEN。"),
+    tokenPrompt: pickUiText(language, "Enter LOCAL_API_TOKEN to continue.", "请输入 LOCAL_API_TOKEN 以继续。"),
+    tokenRetryPrompt: pickUiText(language, "The local token was rejected. Enter LOCAL_API_TOKEN again to retry.", "本地令牌验证失败，请重新输入 LOCAL_API_TOKEN 以重试。"),
     stage: pickUiText(language, "Stage", "阶段"),
     owner: pickUiText(language, "Owner", "当前负责"),
     executor: pickUiText(language, "Executor", "执行者"),
@@ -178,6 +182,8 @@ export function renderTaskRoomClientScript(language: UiLanguage): string {
   const approveBtn = root.querySelector('[data-task-room-approve]');
   const rejectBtn = root.querySelector('[data-task-room-reject]');
   const tokenKey = 'openclaw:local-api-token';
+  const tokenHeader = ((document.body?.dataset?.localTokenHeader || 'x-local-token').trim() || 'x-local-token');
+  const tokenGateRequired = (document.body?.dataset?.tokenRequired || '') === '1';
   let selectedRoomId = String(bootstrap.selectedRoomId || '');
   let roomMessages = [];
   let roomDrafts = new Map();
@@ -202,13 +208,22 @@ export function renderTaskRoomClientScript(language: UiLanguage): string {
   }[role] || role || '');
   const readToken = () => {
     try {
-      const stored = window.localStorage.getItem(tokenKey) || '';
-      if (stored) return stored;
+      return (window.localStorage.getItem(tokenKey) || '').trim();
     } catch {}
-    return (document.body?.dataset?.localTokenValue || '').trim();
+    return '';
   };
   const writeToken = (token) => {
     try { window.localStorage.setItem(tokenKey, token || ''); } catch {}
+  };
+  const clearToken = () => {
+    try { window.localStorage.removeItem(tokenKey); } catch {}
+  };
+  const requestToken = (message) => {
+    const next = typeof window.prompt === 'function'
+      ? String(window.prompt(message || labels.needToken, '') || '').trim()
+      : '';
+    if (next) writeToken(next);
+    return next;
   };
   const syncRoomUrl = (roomId) => {
     try {
@@ -218,13 +233,10 @@ export function renderTaskRoomClientScript(language: UiLanguage): string {
       window.history.replaceState({}, '', url.toString());
     } catch {}
   };
-  const ensureToken = () => {
-    let token = readToken();
-    if (token) {
-      writeToken(token);
-      return token;
-    }
-    return token;
+  const ensureToken = (message) => {
+    const stored = readToken();
+    if (stored) return stored;
+    return requestToken(message || labels.tokenPrompt || labels.needToken);
   };
   const setFlash = (message, tone = 'info') => {
     if (!flash) return;
@@ -321,11 +333,17 @@ export function renderTaskRoomClientScript(language: UiLanguage): string {
         : '<div class="meta">-</div>');
   };
 
+  const extractErrorMessage = (data) => {
+    if (data && data.error && typeof data.error === 'object' && data.error.message) {
+      return data.error.message;
+    }
+    return data && data.error && typeof data.error === 'string' ? data.error : labels.error;
+  };
   const fetchJson = async (url, options = {}) => {
     const res = await fetch(url, options);
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const errorMessage = data && data.error && data.error.message ? data.error.message : labels.error;
+      const errorMessage = extractErrorMessage(data);
       throw new Error(errorMessage);
     }
     return data;
@@ -420,16 +438,33 @@ export function renderTaskRoomClientScript(language: UiLanguage): string {
   };
 
   const mutateRoom = async (url, body) => {
-    const token = ensureToken();
+    const requestOnce = async (token) => {
+      const headers = { 'Content-Type': 'application/json' };
+      if (token) headers[tokenHeader] = token;
+      const response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body || {}),
+      });
+      const data = await response.json().catch(() => ({}));
+      return { response, data };
+    };
+    if (!tokenGateRequired) {
+      const { response, data } = await requestOnce('');
+      if (!response.ok) throw new Error(extractErrorMessage(data));
+      return data;
+    }
+    let token = ensureToken(labels.tokenPrompt);
     if (!token) throw new Error(labels.needToken);
-    return fetchJson(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-local-token': token,
-      },
-      body: JSON.stringify(body || {}),
-    });
+    let { response, data } = await requestOnce(token);
+    if (response.status === 401) {
+      clearToken();
+      token = requestToken(labels.tokenRetryPrompt || labels.tokenPrompt || labels.needToken);
+      if (!token) throw new Error(labels.needToken);
+      ({ response, data } = await requestOnce(token));
+    }
+    if (!response.ok) throw new Error(extractErrorMessage(data));
+    return data;
   };
 
   if (compose instanceof HTMLFormElement && input instanceof HTMLTextAreaElement) {

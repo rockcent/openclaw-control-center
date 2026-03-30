@@ -101,6 +101,77 @@ test("hall API docs and routes are exposed", async () => {
   }
 });
 
+test("hall mutation routes require local token when the gate is enabled", async () => {
+  const backups = await backupFiles([
+    COLLABORATION_HALLS_PATH,
+    COLLABORATION_HALL_MESSAGES_PATH,
+    COLLABORATION_TASK_CARDS_PATH,
+    COLLABORATION_HALL_SUMMARIES_PATH,
+    PROJECTS_PATH,
+    TASKS_PATH,
+    CHAT_ROOMS_PATH,
+    CHAT_MESSAGES_PATH,
+  ]);
+  const localToken = "test-local-token";
+
+  try {
+    const created = await createHallTaskFromOperatorRequest(
+      {
+        content: "Create one token-gated hall task.",
+      },
+      { skipDiscussion: true },
+    );
+
+    const server = startUiServer(0, new ReadonlyToolClient(), {
+      localTokenAuthRequired: true,
+      localApiToken: localToken,
+    });
+    try {
+      if (!server.listening) {
+        await new Promise<void>((resolve, reject) => {
+          server.once("listening", resolve);
+          server.once("error", reject);
+        });
+      }
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Failed to bind ephemeral UI port.");
+      const baseUrl = `http://127.0.0.1:${address.port}`;
+
+      const blockedResponse = await fetch(`${baseUrl}/api/hall/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          taskCardId: created.taskCard!.taskCardId,
+          content: "tokenless hall reply",
+        }),
+      });
+      assert.equal(blockedResponse.status, 401);
+
+      const allowedResponse = await fetch(`${baseUrl}/api/hall/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-local-token": localToken,
+        },
+        body: JSON.stringify({
+          taskCardId: created.taskCard!.taskCardId,
+          content: "tokened hall reply",
+        }),
+      });
+      assert.equal(allowedResponse.status, 201);
+      const allowedPayload = await allowedResponse.json() as { ok: boolean; message?: { content?: string } };
+      assert.equal(allowedPayload.ok, true);
+      assert.equal(allowedPayload.message?.content, "tokened hall reply");
+    } finally {
+      if (server.listening) {
+        await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+      }
+    }
+  } finally {
+    await restoreFiles(backups);
+  }
+});
+
 async function backupFiles(paths: string[]): Promise<Map<string, string | undefined>> {
   const backups = new Map<string, string | undefined>();
   for (const path of paths) backups.set(path, await readOptionalFile(path));

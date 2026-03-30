@@ -102,6 +102,29 @@ test("summarizeOpenClawConnection keeps gateway and config in partial mode when 
   assert.equal(summary.items[1]?.value, "Partial");
 });
 
+test("summarizeOpenClawConnection avoids blocked gateway status when runtime is flowing but direct probe is unavailable", () => {
+  const summary = summarizeOpenClawConnection(
+    {
+      runtimeVersion: "2026.3.24",
+      sessions: { count: 3 },
+      agents: { agents: [{ agentId: "main", sessionsCount: 3 }] },
+    },
+    {},
+  );
+
+  assert.equal(summary.status, "info");
+  assert.equal(summary.items[0]?.key, "gateway");
+  assert.equal(summary.items[0]?.status, "info");
+  assert.equal(summary.items[0]?.value, "Partial");
+  assert.equal(
+    summary.items[0]?.detail,
+    "Runtime data is flowing, but the direct Gateway probe is unavailable on this host",
+  );
+  assert.equal(summary.items[2]?.key, "runtime");
+  assert.equal(summary.items[2]?.status, "ok");
+  assert.equal(summary.items[2]?.value, "3");
+});
+
 test("summarizeOpenClawSecurity keeps counts and remediation", () => {
   const summary = summarizeOpenClawSecurity({
     summary: { critical: 1, warn: 2, info: 1 },

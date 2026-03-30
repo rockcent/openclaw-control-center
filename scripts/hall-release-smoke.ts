@@ -10,6 +10,7 @@ const PORT = process.env.HALL_SMOKE_PORT || "4517";
 const RUNTIME_DIR = mkdtempSync(join(tmpdir(), "hall-release-smoke-"));
 const PAGE_TIMEOUT_MS = 30_000;
 const SERVER_TIMEOUT_MS = 20_000;
+const SMOKE_LOCAL_TOKEN = "hall-smoke-local-token";
 
 type SeededTask = {
   hallId: string;
@@ -504,6 +505,8 @@ function startServer(): ChildProcessWithoutNullStreams {
       OPENCLAW_RUNTIME_DIR: RUNTIME_DIR,
       UI_MODE: "true",
       UI_PORT: PORT,
+      LOCAL_TOKEN_AUTH_REQUIRED: "true",
+      LOCAL_API_TOKEN: SMOKE_LOCAL_TOKEN,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -515,6 +518,18 @@ async function runBrowserSmoke(baseUrl: string, firstTask: SeededTask, secondTas
   const page = await browser.newPage();
   const pageErrors: string[] = [];
   page.on("pageerror", (error) => pageErrors.push(String(error?.message || error)));
+  page.on("dialog", async (dialog) => {
+    if (dialog.type() === "prompt" && dialog.message().includes("LOCAL_API_TOKEN")) {
+      await dialog.accept(SMOKE_LOCAL_TOKEN);
+      return;
+    }
+    await dialog.dismiss();
+  });
+  await page.addInitScript((token) => {
+    try {
+      window.localStorage.setItem("openclaw:local-api-token", token);
+    } catch {}
+  }, SMOKE_LOCAL_TOKEN);
 
   try {
     await page.goto(`${baseUrl}/?section=hall-chat&taskCardId=${encodeURIComponent(firstTask.taskCardId)}`, {

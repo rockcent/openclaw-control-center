@@ -30,6 +30,7 @@ import {
   type AuditSeverity,
   type AuditTimelineSnapshot,
 } from "../runtime/audit-timeline";
+import { collectDiagnosticsBundle, formatDiagnosticsText } from "../runtime/diagnostics-bundle";
 import { loadLatestDigest, renderLatestDigestPage } from "../runtime/digest-renderer";
 import { buildExportBundle, writeExportBundle } from "../runtime/export-bundle";
 import { buildHealthzPayload } from "../runtime/healthz";
@@ -163,6 +164,7 @@ import {
 } from "../runtime/office-session-presence";
 import {
   AVATAR_UPLOADS_DIR,
+  defaultAvatarPreferences,
   loadAvatarPreferences,
   listAvatarUploads,
   resolveEffectiveAvatar,
@@ -574,6 +576,7 @@ let renderUsageCostFullCache:
 let renderOfficePresenceCache:
   | { expiresAt: number; value: OfficeSessionPresenceSnapshot }
   | undefined;
+let renderOfficePresenceInFlight: Promise<OfficeSessionPresenceSnapshot> | undefined;
 let renderReplayPreviewCache:
   | {
       value: Awaited<ReturnType<typeof loadReplayIndex>>;
@@ -639,6 +642,77 @@ let renderLiveSessionsCache:
   | undefined;
 let renderLiveSessionsInFlight: Promise<Awaited<ReturnType<ToolClient["sessionsList"]>>> | undefined;
 let renderReplayPreviewInFlight: Promise<Awaited<ReturnType<typeof loadReplayIndex>>> | undefined;
+
+function emptyReplayPreview(): Awaited<ReturnType<typeof loadReplayIndex>> {
+  return {
+    generatedAt: "",
+    timeline: {
+      path: "",
+      totalLines: 0,
+      entries: [],
+    },
+    digests: [],
+    exportSnapshots: [],
+    exportBundles: [],
+    stats: {
+      timeline: {
+        total: 0,
+        returned: 0,
+        filteredOut: 0,
+        filteredOutByWindow: 0,
+        filteredOutByLimit: 0,
+        latencyMs: 0,
+        latencyBucketsMs: { p50: 0, p95: 0 },
+        totalSizeBytes: 0,
+        returnedSizeBytes: 0,
+      },
+      digests: {
+        total: 0,
+        returned: 0,
+        filteredOut: 0,
+        filteredOutByWindow: 0,
+        filteredOutByLimit: 0,
+        latencyMs: 0,
+        latencyBucketsMs: { p50: 0, p95: 0 },
+        totalSizeBytes: 0,
+        returnedSizeBytes: 0,
+      },
+      exportSnapshots: {
+        total: 0,
+        returned: 0,
+        filteredOut: 0,
+        filteredOutByWindow: 0,
+        filteredOutByLimit: 0,
+        latencyMs: 0,
+        latencyBucketsMs: { p50: 0, p95: 0 },
+        totalSizeBytes: 0,
+        returnedSizeBytes: 0,
+      },
+      exportBundles: {
+        total: 0,
+        returned: 0,
+        filteredOut: 0,
+        filteredOutByWindow: 0,
+        filteredOutByLimit: 0,
+        latencyMs: 0,
+        latencyBucketsMs: { p50: 0, p95: 0 },
+        totalSizeBytes: 0,
+        returnedSizeBytes: 0,
+      },
+      total: {
+        total: 0,
+        returned: 0,
+        filteredOut: 0,
+        filteredOutByWindow: 0,
+        filteredOutByLimit: 0,
+        latencyMs: 0,
+        latencyBucketsMs: { p50: 0, p95: 0 },
+        totalSizeBytes: 0,
+        returnedSizeBytes: 0,
+      },
+    },
+  };
+}
 
 type GlobalVisibilityTaskStatus = "done" | "not_done";
 
@@ -989,7 +1063,7 @@ export function startUiServer(port: number, toolClient: ToolClient, options: Sta
       req,
       routeLabel,
       {
-        gateRequired: false,
+        gateRequired: localTokenGateRequired,
         configuredToken: localApiToken,
       },
       explicitToken,
@@ -1172,6 +1246,19 @@ export function startUiServer(port: number, toolClient: ToolClient, options: Sta
         return writeJson(res, 200, {
           ok: true,
           docs: buildApiDocs(),
+        });
+      }
+
+      if (method === "GET" && path === "/api/diagnostics") {
+        assertAllowedQueryParams(url.searchParams, ["format"], true);
+        const format = normalizeQueryString(url.searchParams.get("format"), "format", 16, true);
+        const diagnostics = await collectDiagnosticsBundle();
+        if (format === "text") {
+          return writeText(res, 200, formatDiagnosticsText(diagnostics), "text/plain; charset=utf-8");
+        }
+        return writeJson(res, 200, {
+          ok: true,
+          diagnostics,
         });
       }
 
@@ -3037,7 +3124,7 @@ async function readReadModelSnapshotWithLiveSessions(toolClient: ToolClient): Pr
 async function primeUiRenderCaches(toolClient: ToolClient): Promise<void> {
   try {
     const snapshot = await readReadModelSnapshotWithLiveSessions(toolClient);
-    await Promise.all([loadCachedUsageCost(snapshot, "full"), loadCachedOfficeSessionPresence(), loadCachedReplayPreview()]);
+    await Promise.all([loadCachedUsageCost(snapshot, "full"), loadCachedOfficeSessionPresence()]);
   } catch (error) {
     console.warn("[mission-control] ui cache warmup failed", {
       error: error instanceof Error ? error.message : String(error),
@@ -5627,14 +5714,37 @@ async function loadCachedOfficeSessionPresence(): Promise<OfficeSessionPresenceS
     return renderOfficePresenceCache.value;
   }
   if (renderOfficePresenceCache) {
+    if (!renderOfficePresenceInFlight) {
+      const nextValue = loadBestEffortOfficeSessionPresence();
+      renderOfficePresenceInFlight = nextValue;
+      void nextValue
+        .then((value) => {
+          renderOfficePresenceCache = {
+            value,
+            expiresAt: Date.now() + HTML_HEAVY_CACHE_TTL_MS,
+          };
+        })
+        .finally(() => {
+          renderOfficePresenceInFlight = undefined;
+        });
+    }
     return renderOfficePresenceCache.value;
   }
-  const value = await loadBestEffortOfficeSessionPresence();
-  renderOfficePresenceCache = {
-    value,
-    expiresAt: now + HTML_HEAVY_CACHE_TTL_MS,
-  };
-  return value;
+  if (renderOfficePresenceInFlight) {
+    return renderOfficePresenceInFlight;
+  }
+  const nextValue = loadBestEffortOfficeSessionPresence();
+  renderOfficePresenceInFlight = nextValue;
+  try {
+    const value = await nextValue;
+    renderOfficePresenceCache = {
+      value,
+      expiresAt: now + HTML_HEAVY_CACHE_TTL_MS,
+    };
+    return value;
+  } finally {
+    renderOfficePresenceInFlight = undefined;
+  }
 }
 
 async function loadCachedReplayPreview(): Promise<Awaited<ReturnType<typeof loadReplayIndex>>> {
@@ -5747,6 +5857,8 @@ async function renderHtml(
   const needsTaskCertainty = activeSection === "overview" || activeSection === "projects-tasks";
   const needsGlobalVisibility = activeSection === "overview";
   const needsExecutionChainPresentation = activeSection === "overview" || activeSection === "projects-tasks";
+  const needsReplayPreview = activeSection === "replay-audit";
+  const needsAvatarPreferences = activeSection === "team";
   markRenderPhase("snapshot");
   const exceptions = commanderExceptions(snapshot);
   const exceptionsFeed = commanderExceptionsFeed(snapshot);
@@ -5796,14 +5908,20 @@ async function renderHtml(
   const [cronOverview, openclawCronJobs, replayPreview, usageCost, officeRoster, officePresence, avatarPreferences] = await Promise.all([
     buildCronOverview(snapshot, POLLING_INTERVALS_MS.cron),
     loadOpenclawCronCatalog(options.language),
-    loadCachedReplayPreview(),
+    needsReplayPreview ? loadCachedReplayPreview() : Promise.resolve(emptyReplayPreview()),
     loadCachedUsageCost(snapshot, usageCostMode),
     loadBestEffortAgentRoster(),
     loadCachedOfficeSessionPresence(),
-    loadAvatarPreferences(),
+    needsAvatarPreferences
+      ? loadAvatarPreferences()
+      : Promise.resolve({
+          path: AVATAR_UPLOADS_DIR,
+          preferences: defaultAvatarPreferences(snapshot.generatedAt),
+          issues: [],
+        }),
   ]);
   markRenderPhase("shared-data");
-  if (avatarPreferences.issues.length > 0) {
+  if (needsAvatarPreferences && avatarPreferences.issues.length > 0) {
     console.warn("[mission-control] avatar preferences normalized", { issues: avatarPreferences.issues });
   }
   const [teamSnapshot, memoryFiles, memoryFacetOptions, workspaceFiles, workspaceFacetOptions, taskEvidenceItems, connectionHealthSummary, securitySummary, updateSummary, memoryStateSummary] = await Promise.all([
@@ -7113,7 +7231,7 @@ async function renderHtml(
               `<tr><td>${escapeHtml(member.displayName)}</td><td><code>${escapeHtml(member.agentId)}</code></td><td>${escapeHtml(member.model)}</td><td>${escapeHtml(member.toolsProfile)}</td><td>${escapeHtml(member.workspace)}</td></tr>`,
           )
           .join("");
-  const teamSection = `
+  const teamSection = activeSection === "team" ? `
     <section class="card">
       <h2>${escapeHtml(t("Staff overview", "员工总览"))}</h2>
       <div class="meta">${escapeHtml(t("The default view shows only name, role, current status, current work, recent output, and whether each person is on the schedule.", "默认视图只显示员工名字、角色定位、当前状态、正在处理什么、最近产出，以及是否在排班里。"))}</div>
@@ -7136,7 +7254,7 @@ async function renderHtml(
         </table>
       </div>
     </details>
-  `;
+  ` : "";
   const hallView = needsHallChat ? await readCollaborationHall() : undefined;
   const selectedHallTaskCard =
     hallView
@@ -7221,7 +7339,7 @@ async function renderHtml(
         selectedTask: selectedTaskRoomTask,
       })
     : "";
-  const collaborationSection = `
+  const collaborationSection = activeSection === "collaboration" ? `
     <section class="card" id="collaboration-hub">
       <div class="overview-command-head">
         <div>
@@ -7280,10 +7398,10 @@ async function renderHtml(
       </div>
       ${collaborationThreadHtml}
     </section>
-  `;
-  const hallChatSection = `
+  ` : "";
+  const hallChatSection = needsHallChat ? `
     ${collaborationHallWorkbench}
-  `;
+  ` : "";
   const memoryMainCount = memoryFiles.filter((entry) => entry.facetKey === "main").length;
   const memoryWorkbench = needsMemoryFiles
     ? await renderEditableFileWorkbench({
@@ -7299,7 +7417,7 @@ async function renderHtml(
       })
     : "";
   const memoryViewsLabel = joinDisplayList(["Main", ...memoryFacetOptions.filter((item) => item.key !== "main").map((item) => item.label)], options.language);
-  const memorySection = `
+  const memorySection = activeSection === "memory" ? `
     <section class="card">
       <h2>${escapeHtml(t("Memory overview", "记忆概览"))}</h2>
       <div class="meta">Main ${escapeHtml(t("memories", "记忆"))} ${memoryMainCount} ${escapeHtml(t("files", "份"))} · ${escapeHtml(t("Agents found", "已发现智能体"))} ${Math.max(0, memoryFacetOptions.filter((item) => item.key !== "main").length)} ${escapeHtml(t("items", "个"))}</div>
@@ -7309,7 +7427,7 @@ async function renderHtml(
     </section>
     ${memoryWorkbench}
     ${memoryStateSection}
-  `;
+  ` : "";
   const mainDocumentCount = workspaceFiles.filter((entry) => entry.facetKey === "main").length;
   const workspaceWorkbench = needsWorkspaceFiles
     ? await renderEditableFileWorkbench({
@@ -7325,7 +7443,7 @@ async function renderHtml(
       })
     : "";
   const documentViewsLabel = joinDisplayList(["Main", ...workspaceFacetOptions.filter((item) => item.key !== "main").map((item) => item.label)], options.language);
-  const docsSection = `
+  const docsSection = activeSection === "docs" ? `
     <section class="card">
       <h2>${escapeHtml(t("Document overview", "文档概览"))}</h2>
       <div class="meta">${escapeHtml(t("Main documents", "Main 文档"))} ${mainDocumentCount} ${escapeHtml(t("files", "份"))} · ${escapeHtml(t("Agents found", "已发现智能体"))} ${Math.max(0, workspaceFacetOptions.filter((item) => item.key !== "main").length)} ${escapeHtml(t("items", "个"))}</div>
@@ -7334,7 +7452,7 @@ async function renderHtml(
       <div class="meta">${escapeHtml(t("Documents are no longer shown by chat history. They are archived by Main or by active agent.", "不再按会话历史展示文档，统一按 Main / 当前启用智能体归档。"))}</div>
     </section>
     ${workspaceWorkbench}
-  `;
+  ` : "";
   const usageSection = `
     <section class="card">
       <h2>${escapeHtml(t("Measurement scope", "统计口径"))}</h2>
@@ -7405,7 +7523,7 @@ async function renderHtml(
       </div>
     </details>
   `;
-  const officeSection = `
+  const officeSection = options.section === "office-space" ? `
     <section class="card">
       <h2>看板映射说明</h2>
       <div class="meta">Alex / Sam / Taylor / Unassigned 这类名称只是 control-center 的分组标签，不是智能体，不会单独消耗预算。</div>
@@ -7442,7 +7560,7 @@ async function renderHtml(
         </details>
       </div>
     </details>
-  `;
+  ` : "";
   const teamUnifiedSection = teamSection;
   const hasTrackedTaskPanels = tasks.length > 0 || pendingDecisionCount > 0 || trackedTaskCount > 0;
   const trackedTaskDetailsOpen = pendingDecisionCount > 0 || trackedTaskCount > 0;
@@ -7589,7 +7707,7 @@ async function renderHtml(
       </details>
     `
     : `<div class="meta">${escapeHtml(trackedTaskExplanation)}</div>`;
-  const projectsSection = `
+  const projectsSection = activeSection === "projects-tasks" ? `
     <section class="task-hub-grid">
       ${calendarSection}
       ${cronExecutionSection}
@@ -7602,8 +7720,8 @@ async function renderHtml(
         ${trackedTaskDetailsBody}
       </div>
     </details>
-  `;
-  const alertsSection = `
+  ` : "";
+  const alertsSection = activeSection === "alerts" ? `
     <section class="card">
       <h2>${escapeHtml(t("Attention items", "关注事项"))}</h2>
       <div class="meta">${escapeHtml(t("Blocked", "阻塞"))} ${exceptions.counts.blocked} · ${escapeHtml(t("Errors", "异常"))} ${exceptions.counts.errors} · ${escapeHtml(t("Pending approvals", "待审批"))} ${exceptions.counts.pendingApprovals} · ${escapeHtml(t("Stalled runs", "停滞执行"))} ${stalledRunningSessionCount}</div>
@@ -7634,8 +7752,8 @@ async function renderHtml(
           : `<table><thead><tr><th>${escapeHtml(t("Status", "状态"))}</th><th>${escapeHtml(t("Scope", "范围"))}</th><th>${escapeHtml(t("Target", "对象"))}</th><th>${escapeHtml(t("Usage", "使用情况"))}</th></tr></thead><tbody>${budgetItems}</tbody></table>`
       }</div>
     </details>
-  `;
-  const replaySection = `
+  ` : "";
+  const replaySection = needsReplayPreview ? `
     <section class="card">
       <h2>${escapeHtml(t("Replay activity", "活动回放"))}</h2>
       ${
@@ -7657,11 +7775,29 @@ async function renderHtml(
       <summary>${escapeHtml(t("Recent timeline", "最近时间线"))}</summary>
       <div class="fold-body"><ul class="story-list">${replayMomentsRows}</ul></div>
     </details>
+  ` : "";
+  const diagnosticsSection = `
+    <section class="card" id="diagnostics-card">
+      <h2>${escapeHtml(t("Diagnostics bundle", "诊断包"))}</h2>
+      <div class="meta">${escapeHtml(
+        t(
+          "Collect app/runtime versions, Gateway connectivity, redacted token presence, and recent failed operation IDs in one report.",
+          "一键收集应用与运行时版本、Gateway 接线、已脱敏 token 存在性，以及最近失败操作的 requestId。",
+        ),
+      )}</div>
+      <div class="toolbar">
+        <a class="btn" href="/api/diagnostics">${escapeHtml(t("Download JSON", "下载 JSON"))}</a>
+        <a class="btn" href="/api/diagnostics?format=text" target="_blank" rel="noreferrer">${escapeHtml(
+          t("View text report", "查看文本报告"),
+        )}</a>
+      </div>
+    </section>
   `;
-  const settingsSection = `
+  const settingsSection = activeSection === "settings" ? `
     ${connectionHealthCard}
     ${securityRiskSection}
     ${updateStatusSection}
+    ${diagnosticsSection}
     <section class="card">
       <h2>安全开关</h2>
       <table>
@@ -7680,7 +7816,7 @@ async function renderHtml(
         <a class="btn" href="${escapeHtml(clearHref)}">${escapeHtml(t("Reset filters", "重置筛选"))}</a>
       </div>
     </section>
-  `;
+  ` : "";
   let sectionBody = overviewSection;
   if (options.section === "calendar") sectionBody = projectsSection;
   if (options.section === "team") sectionBody = teamUnifiedSection;
@@ -7955,6 +8091,7 @@ async function renderHtml(
         radial-gradient(circle at 84% 18%, rgba(255, 255, 255, 0.02), transparent 18%),
         linear-gradient(180deg, rgba(255, 255, 255, 0.008), transparent 34%);
     }
+    html { min-height: 100%; }
     * { box-sizing: border-box; }
     body {
       font-family: "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans SC", "Helvetica Neue", sans-serif;
@@ -7963,10 +8100,12 @@ async function renderHtml(
       line-height: 1.58;
       margin: 0;
       min-height: 100vh;
+      min-height: 100dvh;
       background: var(--page-bg);
       position: relative;
       text-rendering: optimizeLegibility;
       -webkit-font-smoothing: antialiased;
+      overflow: hidden;
     }
     .ui-preload .app-shell { opacity: 1; transform: translateY(0); }
     body.ui-ready .app-shell { opacity: 1; transform: translateY(0); transition: opacity 260ms ease, transform 320ms ease; }
@@ -8016,9 +8155,13 @@ async function renderHtml(
       gap: var(--space-2);
       padding: var(--space-3);
       max-width: 1880px;
+      min-height: 100dvh;
+      height: 100dvh;
       margin: 0 auto;
       position: relative;
       isolation: isolate;
+      align-items: stretch;
+      overflow: hidden;
     }
     html[data-theme="dark"] .app-shell::before {
       content: "";
@@ -8222,7 +8365,14 @@ async function renderHtml(
       -webkit-backdrop-filter: blur(var(--apple-glass-blur));
       animation: panel-in 320ms ease both;
       position: relative;
-      overflow: hidden;
+      min-height: 0;
+      max-height: 100%;
+      overflow-x: hidden;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      scrollbar-gutter: stable;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(126, 138, 154, 0.45) transparent;
     }
     .brand {
       position: relative;
@@ -8351,7 +8501,14 @@ async function renderHtml(
       -webkit-backdrop-filter: blur(16px);
       animation: panel-in 350ms ease both;
       position: relative;
-      overflow: hidden;
+      min-height: 0;
+      max-height: 100%;
+      overflow-x: hidden;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      scrollbar-gutter: stable;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(126, 138, 154, 0.45) transparent;
     }
     .section-title { font-size: var(--font-large-title); font-weight: 760; letter-spacing: -0.03em; line-height: 1.05; }
     .section-blurb { margin-top: 4px; font-size: var(--font-body); color: #6e6e73; }
@@ -10731,6 +10888,7 @@ async function renderHtml(
       scrollbar-color: rgba(126, 138, 154, 0.45) transparent;
     }
     .file-nav::-webkit-scrollbar,
+    .sidebar::-webkit-scrollbar,
     .panel::-webkit-scrollbar,
     .card::-webkit-scrollbar,
     textarea::-webkit-scrollbar {
@@ -10738,6 +10896,7 @@ async function renderHtml(
       height: 8px;
     }
     .file-nav::-webkit-scrollbar-thumb,
+    .sidebar::-webkit-scrollbar-thumb,
     .panel::-webkit-scrollbar-thumb,
     .card::-webkit-scrollbar-thumb,
     textarea::-webkit-scrollbar-thumb {
@@ -10747,6 +10906,7 @@ async function renderHtml(
       background-clip: padding-box;
     }
     .file-nav::-webkit-scrollbar-track,
+    .sidebar::-webkit-scrollbar-track,
     .panel::-webkit-scrollbar-track,
     .card::-webkit-scrollbar-track,
     textarea::-webkit-scrollbar-track {
@@ -11014,9 +11174,23 @@ async function renderHtml(
       .collaboration-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 1320px) {
-      .app-shell { grid-template-columns: 1fr 284px; }
-      .app-shell > .sidebar:first-of-type { grid-column: 1 / -1; }
-      .panel { grid-column: 1; }
+      body:not(.section-hall-chat) .app-shell {
+        grid-template-columns: 1fr 284px;
+        grid-template-rows: auto minmax(0, 1fr);
+      }
+      body:not(.section-hall-chat) .app-shell > .sidebar:first-of-type {
+        grid-column: 1 / -1;
+        grid-row: 1;
+        max-height: none;
+      }
+      body:not(.section-hall-chat) .panel {
+        grid-column: 1;
+        grid-row: 2;
+      }
+      body:not(.section-hall-chat) .inspector-sidebar {
+        grid-column: 2;
+        grid-row: 2;
+      }
       .section-hero-head { flex-direction: column; align-items: stretch; }
       .section-head-actions { justify-content: flex-start; }
       .overview-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -11036,8 +11210,20 @@ async function renderHtml(
       .staff-brief-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 1080px) {
-      .app-shell { grid-template-columns: 1fr; }
-      .sidebar, .panel { order: unset; }
+      body { overflow: auto; }
+      body:not(.section-hall-chat) .app-shell {
+        grid-template-columns: 1fr;
+        min-height: auto;
+        height: auto;
+        overflow: visible;
+      }
+      body:not(.section-hall-chat) .sidebar,
+      body:not(.section-hall-chat) .panel {
+        order: unset;
+        max-height: none;
+        overflow: visible;
+        scrollbar-gutter: auto;
+      }
       .section-title { font-size: 25px; }
       .overview-v3-shell { grid-template-columns: 1fr; }
       .overview-kpi-grid { grid-template-columns: 1fr; }
@@ -11085,7 +11271,7 @@ async function renderHtml(
     }
   </style>
 </head>
-<body class="ui-preload${collaborationImmersive ? " section-collaboration" : ""}${activeSection === "hall-chat" ? " section-hall-chat" : ""}" data-ui-polish="apple-native-v3" data-apple-window-controls="true" data-ui-language="${escapeHtml(options.language)}" data-token-required="${LOCAL_TOKEN_AUTH_REQUIRED ? "1" : "0"}" data-token-configured="${LOCAL_API_TOKEN ? "1" : "0"}" data-local-token-header="${escapeHtml(LOCAL_TOKEN_HEADER)}" data-local-token-value="${escapeHtml(LOCAL_API_TOKEN)}" style="--fold-open-label:${options.language === "en" ? "'Expand'" : "'展开'"}; --fold-close-label:${options.language === "en" ? "'Collapse'" : "'收起'"};">
+<body class="ui-preload${collaborationImmersive ? " section-collaboration" : ""}${activeSection === "hall-chat" ? " section-hall-chat" : ""}" data-ui-polish="apple-native-v3" data-apple-window-controls="true" data-ui-language="${escapeHtml(options.language)}" data-token-required="${LOCAL_TOKEN_AUTH_REQUIRED ? "1" : "0"}" data-token-configured="${LOCAL_API_TOKEN ? "1" : "0"}" data-local-token-header="${escapeHtml(LOCAL_TOKEN_HEADER)}" style="--fold-open-label:${options.language === "en" ? "'Expand'" : "'展开'"}; --fold-close-label:${options.language === "en" ? "'Collapse'" : "'收起'"};">
   <div class="app-shell">
     <aside class="sidebar">
       <div class="brand">
@@ -15737,6 +15923,9 @@ function renderAvatarEditorScript(language: UiLanguage = "zh", importMutationEna
     save: pickUiText(language, "Save", "保存"),
     saveOk: pickUiText(language, "Saved successfully", "保存成功"),
     failed: pickUiText(language, "Operation failed.", "操作失败。"),
+    needToken: pickUiText(language, "This action requires LOCAL_API_TOKEN.", "这个动作需要 LOCAL_API_TOKEN。"),
+    tokenPrompt: pickUiText(language, "Enter LOCAL_API_TOKEN to save avatar changes.", "请输入 LOCAL_API_TOKEN 以保存头像改动。"),
+    tokenRetryPrompt: pickUiText(language, "The local token was rejected. Enter LOCAL_API_TOKEN again to retry.", "本地令牌验证失败，请重新输入 LOCAL_API_TOKEN 以重试。"),
   };
   const animalLabels: Record<string, string> = {
     robot: animalLabel("robot", language),
@@ -15776,30 +15965,60 @@ function renderAvatarEditorScript(language: UiLanguage = "zh", importMutationEna
     try { window.localStorage.setItem(avatarPrefKey(agentId), JSON.stringify(pref)); } catch {}
   };
   const tokenKey = () => 'openclaw:local-api-token';
+  const tokenHeader = ((document.body?.dataset?.localTokenHeader || 'x-local-token').trim() || 'x-local-token');
   const readToken = () => {
     try {
-      const stored = window.localStorage.getItem(tokenKey()) || '';
-      if (stored) return stored;
+      return (window.localStorage.getItem(tokenKey()) || '').trim();
     } catch {}
-    return (document.body?.dataset?.localTokenValue || '').trim();
+    return '';
   };
   const writeToken = (token) => {
     try { window.localStorage.setItem(tokenKey(), token || ''); } catch {}
   };
+  const clearToken = () => {
+    try { window.localStorage.removeItem(tokenKey()); } catch {}
+  };
+  const requestToken = (message) => {
+    const next = typeof window.prompt === 'function'
+      ? String(window.prompt(message || L.needToken, '') || '').trim()
+      : '';
+    if (next) writeToken(next);
+    return next;
+  };
+  const ensureToken = (message) => {
+    const stored = readToken();
+    if (stored) return stored;
+    return requestToken(message || L.tokenPrompt || L.needToken);
+  };
+  const fetchWithLocalToken = async (url, init) => {
+    const send = async (token) => fetch(url, {
+      ...init,
+      headers: {
+        ...(init && init.headers ? init.headers : {}),
+        [tokenHeader]: token,
+      },
+    });
+    let token = ensureToken(L.tokenPrompt);
+    if (!token) return null;
+    let response = await send(token);
+    if (response.status !== 401) return response;
+    clearToken();
+    token = requestToken(L.tokenRetryPrompt || L.tokenPrompt);
+    if (!token) return response;
+    response = await send(token);
+    return response;
+  };
   const saveAvatarToServer = async (agentId, pref) => {
     if (!IMPORT_MUTATION_ENABLED || !agentId || !pref) return false;
-    let token = readToken();
-    if (!token) return false;
-    writeToken(token);
     try {
-      const res = await fetch('/api/avatar/preferences', {
+      const res = await fetchWithLocalToken('/api/avatar/preferences', {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
-          'x-local-token': token,
         },
         body: JSON.stringify({ agentId, mode: pref.mode, animal: pref.animal, image: pref.image }),
       });
+      if (!res) return false;
       if (res.status === 401) {
         return false;
       }
@@ -15822,18 +16041,15 @@ function renderAvatarEditorScript(language: UiLanguage = "zh", importMutationEna
   };
   const uploadAvatarToServer = async (dataUrl, fileNameHint) => {
     if (!IMPORT_MUTATION_ENABLED || !dataUrl) return null;
-    let token = readToken();
-    if (!token) return null;
-    writeToken(token);
     try {
-      const res = await fetch('/api/avatar/uploads', {
+      const res = await fetchWithLocalToken('/api/avatar/uploads', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-local-token': token,
         },
         body: JSON.stringify({ dataUrl, fileName: fileNameHint }),
       });
+      if (!res) return null;
       if (res.status === 401) {
         return null;
       }
